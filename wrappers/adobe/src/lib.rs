@@ -39,6 +39,35 @@ fn gpu() -> Option<&'static Gpu> {
     .as_ref()
 }
 
+/// The plugin's CPU render path without After Effects, for the test harness in
+/// `ae-tests/`, which compares After Effects' output against it. Not a public API.
+#[doc(hidden)]
+pub mod reference {
+    pub use crate::params::{Blur, Settings, Vignette};
+
+    /// Renders one frame of straight-alpha RGBA f32 pixels the way `render_frame` does
+    /// for a layer whose buffer lines up with the output. `None` without a GPU.
+    pub fn render(
+        settings: &Settings,
+        width: u32,
+        height: u32,
+        input: &[f32],
+        layer: Option<&[f32]>,
+        time: f64,
+    ) -> Option<Vec<f32>> {
+        let job = crate::pipeline::Job {
+            settings,
+            width,
+            height,
+            input,
+            layer,
+            canvas_origin: [0.0, 0.0],
+            time,
+        };
+        Some(crate::pipeline::run(crate::gpu()?, &job))
+    }
+}
+
 fn warn_once(message: &str) {
     diag::note(&format!("warning: {message}"));
     if !WARNED.swap(true, Ordering::Relaxed) {
