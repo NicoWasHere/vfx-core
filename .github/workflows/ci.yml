@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install software Vulkan (lavapipe) for headless rendering
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy -p vfx-core --all-targets -- -D warnings
+
+      - name: Tests (headless render, reference checks)
+        env:
+          WGPU_BACKEND: ${{ runner.os == 'Linux' && 'vulkan' || '' }}
+        run: cargo test -p vfx-core
+
+  # The After Effects / Premiere plugin: a universal .plugin bundle on macOS and an
+  # .aex on Windows. Unsigned; signing needs the publisher's certificates.
+  adobe-plugin:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Wrapper tests (pixel conversion, pipeline, Metal interop on macOS)
+        run: cargo test -p vfx-adobe --lib
+
+      - name: Build macOS bundle and installer
+        if: runner.os == 'macOS'
+        run: ./wrappers/adobe/package-mac.sh
+
+      - name: Build Windows .aex
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build -p vfx-adobe --release
+          mkdir -p target/vfx-plugin
+          cp target/release/vfx_adobe.dll target/vfx-plugin/VfxAdobe.aex
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vfx-adobe-${{ runner.os }}
+          path: |
+            target/vfx-plugin/VfxAdobe.pkg
+            target/vfx-plugin/VfxAdobe.plugin
+            target/vfx-plugin/VfxAdobe.aex
+          if-no-files-found: error

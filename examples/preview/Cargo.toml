@@ -1,0 +1,13 @@
+[package]
+name = "vfx-preview"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+vfx-core = { path = "../.." }
+wgpu = "=30.0.1"
+winit = "0.31.0-beta.4"
+pollster = "1.0.1"
+bytemuck = "1.25.2"

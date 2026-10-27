@@ -1,0 +1,18 @@
+[package]
+name = "vfx-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+wgpu = "=30.0.1"
+
+[dev-dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
+
+[workspace]
+members = [".", "examples/preview", "wrappers/adobe"]
+# Plain `cargo test` builds only the core, so windowing never enters CI on Linux.
+default-members = ["."]

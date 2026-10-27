@@ -1,0 +1,23 @@
+[package]
+name = "vfx-adobe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vfx-core = { path = "../.." }
+after-effects = "0.4.0"
+bytemuck = "1.25.2"
+pollster = "1.0.1"
+
+# GPU-native rendering on After Effects' Metal device. Same versions wgpu uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLBuffer", "MTLResource"] }
+
+[build-dependencies]
+pipl = "0.1.1"
