@@ -93,7 +93,7 @@ pub const PARAMS: &[Param] = &[
     typed(c"Vignette X", FF_TYPE_XPOS, 0.5, "Vignette"),
     typed(c"Vignette Y", FF_TYPE_YPOS, 0.5, "Vignette"),
     slider(c"Vignette Radius", 0.0, 2.0, 0.75, "Vignette"),
-    slider(c"Vignette Softness", 0.0, 1.0, 0.5, "Vignette"),
+    slider(c"Vignette Soft", 0.0, 1.0, 0.5, "Vignette"),
     // Consecutive RED / GREEN / BLUE params become one colour picker in Resolume.
     typed(c"Vignette Red", FF_TYPE_RED, 0.0, "Vignette"),
     typed(c"Vignette Green", FF_TYPE_GREEN, 0.0, "Vignette"),
@@ -195,6 +195,16 @@ mod tests {
         assert_eq!(PARAMS[VIGNETTE_AMOUNT].name, c"Vignette Amount");
         assert_eq!(PARAMS[BLUR_DIRECTION].name, c"Blur Direction");
         assert_eq!(PARAMS.len(), BLUR_DIRECTION + 1);
+    }
+
+    #[test]
+    fn names_stay_under_16_characters() {
+        // FFGL hosts show 16 bytes of a name at most; Resolume cuts the rest. The
+        // other wrappers use the same names, so this keeps them all short.
+        for p in PARAMS {
+            let n = p.name.to_bytes().len();
+            assert!(n < 16, "{:?} is {n} bytes; keep names under 16", p.name);
+        }
     }
 
     #[test]

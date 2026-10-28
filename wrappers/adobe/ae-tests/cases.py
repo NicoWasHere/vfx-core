@@ -32,7 +32,7 @@ DEFAULTS = {
     "Vignette": False,
     "Vignette Center": None,  # layer centre
     "Vignette Radius": 0.75,
-    "Vignette Softness": 0.5,
+    "Vignette Soft": 0.5,
     "Vignette Color": (0.0, 0.0, 0.0, 1.0),
     "Vignette Amount": 1.0,
     "Blend Mode": 0,
@@ -128,7 +128,7 @@ CASES = [
                 "Vignette": True,
                 "Vignette Center": (30.0, 20.0),
                 "Vignette Radius": 0.4,
-                "Vignette Softness": 0.3,
+                "Vignette Soft": 0.3,
                 "Vignette Color": (1.0, 0.0, 0.0, 1.0),
                 "Vignette Amount": 0.6,
             }

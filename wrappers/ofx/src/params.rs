@@ -179,7 +179,7 @@ pub fn define(set: ParamSet, blend: bool) -> Result<(), OfxStatus> {
     )?;
     d.slider(
         VIGNETTE_SOFTNESS,
-        "Vignette Softness",
+        "Vignette Soft",
         0.0,
         1.0,
         0.5,
