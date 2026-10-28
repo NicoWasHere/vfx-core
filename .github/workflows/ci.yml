@@ -35,6 +35,12 @@ jobs:
           WGPU_BACKEND: ${{ runner.os == 'Linux' && 'vulkan' || '' }}
         run: cargo test -p vfx-core
 
+      # The segcam Motion example: its core is plain Rust, so it tests on every OS.
+      - name: segcam Motion example (clippy, core checks)
+        run: |
+          cargo clippy -p segcam-motion --all-targets -- -D warnings
+          cargo test -p segcam-motion
+
   # The After Effects / Premiere plugin: a universal .plugin bundle on macOS and an
   # .aex on Windows. Unsigned; signing needs the publisher's certificates.
   adobe-plugin:
@@ -66,16 +72,19 @@ jobs:
 
       - name: Build macOS bundle and installer
         if: runner.os == 'macOS'
-        run: ./wrappers/adobe/package-mac.sh
+        run: |
+          ./wrappers/adobe/package-mac.sh
+          ./examples/segcam-motion/package-mac.sh
 
       - name: Build Windows .aex
         if: runner.os == 'Windows'
         shell: bash
         run: |
           . ./plugin.env
-          cargo build -p vfx-adobe --release
+          cargo build -p vfx-adobe -p segcam-motion --release
           mkdir -p target/vfx-plugin
           cp target/release/vfx_adobe.dll "target/vfx-plugin/$PLUGIN_FILE.aex"
+          cp target/release/segcam_motion.dll target/vfx-plugin/SegcamMotionRust.aex
 
       # OpenFX on Windows: the same unit tests and mini host as on macOS, the host built
       # with the runner's clang, then the bundle for Resolve and other OpenFX hosts.
