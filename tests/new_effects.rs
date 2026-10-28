@@ -1,6 +1,6 @@
-//! Vignette, Blend, PixelConvert transfer curves and blur direction, on float frames.
+//! Vignette, Blend, Flip, PixelConvert transfer curves and blur direction, on float frames.
 
-use vfx_core::effects::{Blend, GaussianBlur, PixelConvert, Vignette};
+use vfx_core::effects::{Blend, Flip, GaussianBlur, PixelConvert, Vignette};
 use vfx_core::{Effect, EffectChain, Frame, Gpu, ParamValue};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
@@ -189,4 +189,44 @@ fn horizontal_blur_does_not_spread_vertically() {
     assert_eq!(at(3, 2), 0.0, "no vertical spread");
     let row: f32 = (0..w).map(|x| at(x, 3)).sum();
     assert!((row - 1.0).abs() < 1e-5, "energy kept along the row: {row}");
+}
+
+#[test]
+fn flip_mirrors_each_axis() {
+    let gpu = gpu();
+    // 3 × 2, every pixel different: red counts across, green down.
+    let (w, h) = (3u32, 2u32);
+    let pixel = |x: u32, y: u32| [x as f32, y as f32, 0.5, 1.0];
+    let input: Vec<[f32; 4]> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| pixel(x, y)))
+        .collect();
+    let flipped = |x: f32, y: f32| {
+        run(
+            &gpu,
+            Flip::default(),
+            (w, h),
+            &input,
+            None,
+            &[
+                ("flip_x", ParamValue::Float(x)),
+                ("flip_y", ParamValue::Float(y)),
+            ],
+        )
+    };
+    let at = |out: &[[f32; 4]], x: u32, y: u32| out[(y * w + x) as usize];
+
+    assert_eq!(flipped(0.0, 0.0), input);
+    let horizontal = flipped(1.0, 0.0);
+    // Values are numbers so they can be animated; above 0.5 flips.
+    assert_eq!(flipped(0.4, 0.0), input);
+    assert_eq!(flipped(0.6, 0.0), horizontal);
+    let vertical = flipped(0.0, 1.0);
+    let both = flipped(1.0, 1.0);
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(at(&horizontal, x, y), pixel(w - 1 - x, y));
+            assert_eq!(at(&vertical, x, y), pixel(x, h - 1 - y));
+            assert_eq!(at(&both, x, y), pixel(w - 1 - x, h - 1 - y));
+        }
+    }
 }
