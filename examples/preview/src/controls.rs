@@ -173,6 +173,7 @@ pub fn panel(ui: &mut Ui, c: &mut Controls, status: &Status) -> Actions {
                 }
                 None => {
                     choice(ui, "pattern", &mut c.pattern, PATTERNS);
+                    #[cfg(not(target_arch = "wasm32"))]
                     ui.label(RichText::new("Drop a PNG or JPEG on the window to use it.").weak());
                 }
             }

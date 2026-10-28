@@ -12,6 +12,7 @@ use crate::controls::Controls;
 /// Generated patterns render at this size; dropped images keep their own.
 pub const PATTERN_SIZE: (u32, u32) = (1280, 720);
 /// Dropped images are scaled down to fit this, to keep the demo interactive.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_IMAGE_SIDE: u32 = 1920;
 /// egui samples "normal" (not sRGB-aware) textures holding gamma-encoded colour,
 /// which is what the pipeline produces.
@@ -294,6 +295,7 @@ impl Effects {
     }
 
     /// Loads a PNG or JPEG as the source, scaled to fit MAX_IMAGE_SIDE.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_image(&mut self, gpu: &Gpu, path: &std::path::Path) -> Result<(), String> {
         let img = image::open(path).map_err(|e| e.to_string())?;
         let img = if img.width().max(img.height()) > MAX_IMAGE_SIDE {

@@ -11,14 +11,17 @@ mod controls;
 mod effects;
 
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 use controls::{Controls, Status};
 use effects::Effects;
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+#[cfg(not(target_arch = "wasm32"))]
+use winit::event::ElementState;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+#[cfg(not(target_arch = "wasm32"))]
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
@@ -42,37 +45,30 @@ struct Preview {
 }
 
 impl Preview {
-    fn new(event_loop: &ActiveEventLoop) -> Self {
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("VFX Preview")
-                        .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 820.0)),
-                )
-                .expect("create window"),
-        );
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
-            Box::new(event_loop.owned_display_handle()),
-        ));
+    /// Opens the GPU for `window` and builds everything else. Async because browsers
+    /// can't block on the GPU; the native build blocks on it with pollster.
+    async fn new(window: Arc<Window>, instance: wgpu::Instance) -> Result<Self, String> {
         let surface = instance
             .create_surface(window.clone())
-            .expect("create window surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("no GPU adapter for the window");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("request device");
+            .map_err(|e| format!("couldn't create a surface: {e}"))?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+            .map_err(|e| format!("no GPU adapter: {e}"))?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .map_err(|e| format!("couldn't open the GPU: {e}"))?;
         let gpu = Gpu::from_parts(device, queue);
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
+        // Browsers offer only non-sRGB canvas formats; egui handles either.
         let format = caps
             .formats
             .iter()
@@ -112,7 +108,7 @@ impl Preview {
         );
         let image_size = effects.size();
 
-        Self {
+        Ok(Self {
             window,
             gpu,
             surface,
@@ -128,7 +124,7 @@ impl Preview {
             last_frame: Instant::now(),
             fps: 0.0,
             message: None,
-        }
+        })
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -150,6 +146,7 @@ impl Preview {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open(&mut self, path: &std::path::Path) {
         self.message = self
             .effects
@@ -291,15 +288,113 @@ fn show_image(
     }
 }
 
-#[derive(Default)]
-struct App {
-    preview: Option<Preview>,
+/// Sent when the (async, on the web) GPU setup finishes.
+enum Ready {
+    Preview(Box<Preview>),
+    Failed(String),
 }
 
-impl ApplicationHandler for App {
+struct App {
+    proxy: EventLoopProxy<Ready>,
+    preview: Option<Preview>,
+    starting: bool,
+}
+
+impl App {
+    fn new(proxy: EventLoopProxy<Ready>) -> Self {
+        Self {
+            proxy,
+            preview: None,
+            starting: false,
+        }
+    }
+}
+
+fn window_attributes() -> winit::window::WindowAttributes {
+    let attributes = Window::default_attributes().with_title("VFX Preview");
+    #[cfg(not(target_arch = "wasm32"))]
+    let attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(1440.0, 820.0));
+    // On the web, winit makes a canvas; the page's CSS sizes it to the window.
+    #[cfg(target_arch = "wasm32")]
+    let attributes = {
+        use winit::platform::web::WindowAttributesExtWebSys;
+        attributes.with_append(true)
+    };
+    attributes
+}
+
+fn instance(event_loop: &ActiveEventLoop) -> wgpu::Instance {
+    #[allow(unused_mut)]
+    let mut descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+        event_loop.owned_display_handle(),
+    ));
+    // The pipeline renders to RGBA32F textures, which WebGL can't, so the web build
+    // needs WebGPU.
+    #[cfg(target_arch = "wasm32")]
+    {
+        descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
+    }
+    wgpu::Instance::new(descriptor)
+}
+
+/// Shows a message in the page (web) or on stderr (native).
+fn report(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(status) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("status"))
+    {
+        status.set_text_content(Some(message));
+        return;
+    }
+    eprintln!("{message}");
+}
+
+impl ApplicationHandler<Ready> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.preview.is_none() {
-            self.preview = Some(Preview::new(event_loop));
+        if self.preview.is_some() || self.starting {
+            return;
+        }
+        self.starting = true;
+        let window = match event_loop.create_window(window_attributes()) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                report(&format!("Couldn't create a window: {e}"));
+                event_loop.exit();
+                return;
+            }
+        };
+        let setup = Preview::new(window, instance(event_loop));
+        let proxy = self.proxy.clone();
+        let finish = move |result: Result<Preview, String>| {
+            let _ = proxy.send_event(match result {
+                Ok(preview) => Ready::Preview(Box::new(preview)),
+                Err(e) => Ready::Failed(e),
+            });
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        finish(pollster::block_on(setup));
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move { finish(setup.await) });
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ready) {
+        match event {
+            Ready::Preview(preview) => {
+                report("");
+                preview.window.request_redraw();
+                self.preview = Some(*preview);
+            }
+            Ready::Failed(e) => {
+                report(&format!(
+                    "VFX Preview needs WebGPU, which this browser didn't provide ({e}). \
+                     Try a current Chrome, Edge or Safari."
+                ));
+                #[cfg(not(target_arch = "wasm32"))]
+                event_loop.exit();
+                #[cfg(target_arch = "wasm32")]
+                let _ = event_loop;
+            }
         }
     }
 
@@ -307,6 +402,7 @@ impl ApplicationHandler for App {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
         let consumed = preview
             .egui_state
             .on_window_event(&preview.window, &event)
@@ -314,13 +410,16 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => preview.resize(size.width, size.height),
+            #[cfg(not(target_arch = "wasm32"))]
             WindowEvent::DroppedFile(path) => preview.open(&path),
+            // Escape quits the native app; a web page shouldn't close itself.
+            #[cfg(not(target_arch = "wasm32"))]
             WindowEvent::KeyboardInput { event, .. }
-                if !consumed && event.state == ElementState::Pressed =>
+                if !consumed
+                    && event.state == ElementState::Pressed
+                    && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
-                if event.logical_key == Key::Named(NamedKey::Escape) {
-                    event_loop.exit();
-                }
+                event_loop.exit();
             }
             WindowEvent::RedrawRequested => preview.draw(),
             _ => {}
@@ -334,8 +433,20 @@ impl ApplicationHandler for App {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut App::default())?;
+    let event_loop = EventLoop::with_user_event().build()?;
+    let mut app = App::new(event_loop.create_proxy());
+    event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// The web entry point, called by wasm-bindgen's generated JavaScript.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use winit::platform::web::EventLoopExtWebSys;
+    console_error_panic_hook::set_once();
+    let event_loop = EventLoop::with_user_event().build().expect("event loop");
+    let app = App::new(event_loop.create_proxy());
+    event_loop.spawn_app(app);
 }
