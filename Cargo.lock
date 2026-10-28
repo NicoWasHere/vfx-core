@@ -2964,8 +2964,13 @@ dependencies = [
  "objc2-metal 0.3.2",
  "pollster",
  "vfx-core",
+ "vfx-ffgl-common",
  "vfx-wrapper-common",
 ]
+
+[[package]]
+name = "vfx-ffgl-common"
+version = "0.1.0"
 
 [[package]]
 name = "vfx-ofx"

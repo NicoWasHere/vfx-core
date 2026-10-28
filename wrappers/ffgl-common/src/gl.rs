@@ -64,7 +64,9 @@ macro_rules! interop_functions {
                 })
             }
         }
-        $(pub(crate) unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+        $(/// # Safety
+          /// The context must be current; arguments must obey the named GL extension.
+          pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
             let functions = FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().unwrap();
             // SAFETY: interop loading succeeded; the caller supplies GL arguments.
             unsafe { (functions.$name)($($arg),*) }
@@ -308,7 +310,7 @@ gl_functions! {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{
+pub use windows::{
     glCreateMemoryObjectsEXT, glDeleteMemoryObjectsEXT, glDeleteSemaphoresEXT, glGenSemaphoresEXT,
     glGetUnsignedBytevEXT, glImportMemoryWin32HandleEXT, glImportSemaphoreWin32HandleEXT,
     glMemoryObjectParameterivEXT, glSignalSemaphoreEXT, glTexStorageMem2DEXT, glWaitSemaphoreEXT,
@@ -316,6 +318,8 @@ pub(crate) use windows::{
 
 /// Checks the optional sharing functions without making them a requirement for RAM.
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
     use std::ffi::CStr;
     let mut count = 0;
@@ -343,6 +347,8 @@ pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn check_error(operation: &str) -> Result<(), String> {
     // SAFETY: the caller has a current context.
     let error = unsafe { glGetError() };
@@ -354,18 +360,24 @@ pub unsafe fn check_error(operation: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn finish_shared() {
     // SAFETY: the caller has a current context.
     unsafe { glFinish() };
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn bind_2d(texture: GLuint) {
     // SAFETY: the caller has a current context and a texture for this target.
     unsafe { glBindTexture(TEXTURE_2D, texture) };
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn nearest_2d(texture: GLuint) {
     // SAFETY: the caller has a current context and owns the texture.
     unsafe {
@@ -527,6 +539,17 @@ unsafe fn compile(kind: GLenum, source: &str) -> Result<GLuint, String> {
 pub unsafe fn read_texture(texture: GLuint, size: (u32, u32)) -> Vec<f32> {
     let mut pixels = vec![0.0f32; size.0 as usize * size.1 as usize * 4];
     // SAFETY: the buffer holds the whole level-0 image in RGBA f32.
+    unsafe { read_texture_into(texture, size, &mut pixels) };
+    pixels
+}
+
+/// Reads a texture into reusable RGBA float storage.
+///
+/// # Safety
+/// The context must be current and `texture` must contain `size` texels.
+pub unsafe fn read_texture_into(texture: GLuint, size: (u32, u32), pixels: &mut [f32]) {
+    assert_eq!(pixels.len(), size.0 as usize * size.1 as usize * 4);
+    // SAFETY: the checked slice holds the whole level-0 image in RGBA f32.
     unsafe {
         glBindTexture(TEXTURE_2D, texture);
         glPixelStorei(PACK_ALIGNMENT, 1);
@@ -534,13 +557,18 @@ pub unsafe fn read_texture(texture: GLuint, size: (u32, u32)) -> Vec<f32> {
         glPixelStorei(PACK_ALIGNMENT, 4);
         glBindTexture(TEXTURE_2D, 0);
     }
-    pixels
 }
 
 /// An RGBA32F texture the plugin owns, resized on demand.
 pub struct Texture {
     pub handle: GLuint,
     size: (u32, u32),
+}
+
+impl Default for Texture {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Texture {
@@ -555,7 +583,7 @@ impl Texture {
     ///
     /// # Safety
     /// The context must be current.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub unsafe fn allocate(&mut self, size: (u32, u32)) {
         // SAFETY: the caller has the context current; null allocates uninitialised storage.
         unsafe { self.update(size, std::ptr::null()) };
