@@ -2402,6 +2402,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "segcam-motion-ffgl"
+version = "0.1.0"
+dependencies = [
+ "segcam-motion",
+ "vfx-ffgl-common",
+ "vfx-wrapper-common",
+]
+
+[[package]]
 name = "self_cell"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
