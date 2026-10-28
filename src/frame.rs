@@ -87,60 +87,8 @@ impl Frame {
     pub fn read_strided(&self, gpu: &Gpu, row_stride: u32) -> Vec<u8> {
         let row_bytes = self.width * self.bytes_per_pixel();
         assert!(row_stride >= row_bytes, "row stride smaller than a row");
-        // The GPU copy needs a 256-byte-aligned row pitch, so read into an aligned
-        // buffer and repack to the caller's stride.
-        let gpu_pitch = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vfx readback"),
-            size: u64::from(gpu_pitch) * u64::from(self.height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(gpu_pitch),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            extent(self.width, self.height),
-        );
-        gpu.queue.submit(Some(encoder.finish()));
-
-        let slice = buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU poll failed during readback");
-        rx.recv()
-            .expect("map callback dropped")
-            .expect("failed to map readback buffer");
-
-        let data = slice.get_mapped_range().expect("readback range is mapped");
         let mut out = vec![0u8; (row_stride * self.height) as usize];
-        for (src, dst) in data
-            .chunks_exact(gpu_pitch as usize)
-            .zip(out.chunks_exact_mut(row_stride as usize))
-        {
-            dst[..row_bytes as usize].copy_from_slice(&src[..row_bytes as usize]);
-        }
-        drop(data);
-        buffer.unmap();
+        Readback::new(gpu, self).read_into(gpu, self, &mut out, row_stride);
         out
     }
 
@@ -185,6 +133,97 @@ impl Frame {
             },
             extent(self.width, self.height),
         );
+    }
+}
+
+/// A reusable readback buffer for frames of one size and format on the same device.
+pub struct Readback {
+    buffer: wgpu::Buffer,
+    size: (u32, u32, wgpu::TextureFormat),
+    gpu_pitch: u32,
+}
+
+impl Readback {
+    pub fn new(gpu: &Gpu, frame: &Frame) -> Self {
+        let row_bytes = frame.width * frame.bytes_per_pixel();
+        // The GPU copy needs a 256-byte-aligned row pitch, so read into an aligned
+        // buffer and repack to the caller's stride.
+        let gpu_pitch = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vfx readback"),
+            size: u64::from(gpu_pitch) * u64::from(frame.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            size: (frame.width, frame.height, frame.format),
+            gpu_pitch,
+        }
+    }
+
+    /// Reads RGBA32F straight into float storage. Blocks until the GPU finishes.
+    pub fn read_f32(&mut self, gpu: &Gpu, frame: &Frame) -> Vec<f32> {
+        assert_eq!(frame.format, wgpu::TextureFormat::Rgba32Float);
+        let mut out = vec![0.0f32; (frame.width * frame.height * 4) as usize];
+        self.read_into(
+            gpu,
+            frame,
+            bytemuck::cast_slice_mut(&mut out),
+            frame.width * frame.bytes_per_pixel(),
+        );
+        out
+    }
+
+    fn read_into(&mut self, gpu: &Gpu, frame: &Frame, out: &mut [u8], row_stride: u32) {
+        assert_eq!(self.size, (frame.width, frame.height, frame.format));
+        let row_bytes = frame.width * frame.bytes_per_pixel();
+        let gpu_pitch = self.gpu_pitch;
+        let buffer = &self.buffer;
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &frame.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(gpu_pitch),
+                    rows_per_image: Some(frame.height),
+                },
+            },
+            extent(frame.width, frame.height),
+        );
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed during readback");
+        rx.recv()
+            .expect("map callback dropped")
+            .expect("failed to map readback buffer");
+
+        let data = slice.get_mapped_range().expect("readback range is mapped");
+        for (src, dst) in data
+            .chunks_exact(gpu_pitch as usize)
+            .zip(out.chunks_exact_mut(row_stride as usize))
+        {
+            dst[..row_bytes as usize].copy_from_slice(&src[..row_bytes as usize]);
+        }
+        drop(data);
+        buffer.unmap();
     }
 }
 

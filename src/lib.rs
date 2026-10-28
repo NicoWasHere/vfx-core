@@ -13,7 +13,7 @@ mod shader;
 
 pub use chain::EffectChain;
 pub use effect::Effect;
-pub use frame::Frame;
+pub use frame::{Frame, Readback};
 pub use gpu::{Gpu, GpuError};
 pub use param::{ParamError, ParamKind, ParamSpec, ParamValue, ParamValues};
 

@@ -2,7 +2,7 @@
 //! float formats. Like the render tests, these need a GPU adapter.
 
 use vfx_core::effects::ColorAdjust;
-use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
+use vfx_core::{EffectChain, Frame, Gpu, ParamValue, Readback};
 
 fn gpu() -> Gpu {
     pollster::block_on(Gpu::headless()).expect("no GPU adapter available for headless tests")
@@ -115,4 +115,30 @@ fn wrong_buffer_size_is_rejected() {
         frame.write(&gpu, &[0u8; 10]);
     }));
     assert!(result.is_err(), "short buffer must panic");
+}
+
+#[test]
+fn float_readback_reuses_buffer_without_stale_pixels_or_row_padding() {
+    let gpu = gpu();
+    // 80-byte rows need padding to the GPU's 256-byte copy pitch.
+    let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
+    let mut readback = Readback::new(&gpu, &frame);
+    for offset in [0.0, 2.0, -0.5] {
+        let input: Vec<f32> = (0..60).map(|i| i as f32 * 0.25 + offset).collect();
+        frame.write(&gpu, bytemuck::cast_slice(&input));
+        assert_eq!(readback.read_f32(&gpu, &frame), input);
+        assert_eq!(frame.read(&gpu), bytemuck::cast_slice::<f32, u8>(&input));
+    }
+}
+
+#[test]
+fn readback_rejects_a_different_frame_size() {
+    let gpu = gpu();
+    let frame = Frame::new(&gpu, 5, 3, wgpu::TextureFormat::Rgba32Float);
+    let other = Frame::new(&gpu, 3, 5, wgpu::TextureFormat::Rgba32Float);
+    let mut readback = Readback::new(&gpu, &frame);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        readback.read_f32(&gpu, &other);
+    }));
+    assert!(result.is_err(), "readback must match the frame's layout");
 }
