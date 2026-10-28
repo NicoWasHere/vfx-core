@@ -83,7 +83,7 @@ struct Media {
     /// While the position slider is being dragged.
     scrub: Option<Scrub>,
     /// Frames on their way to the GPU, through segcam when it's on.
-    segcam: segcam::Segcam,
+    segcam: segcam::Worker,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -254,7 +254,7 @@ impl Preview {
             Ok(video) => {
                 self.effects.start_stream(&self.gpu, name, video.info.size);
                 let file = video.info.file();
-                let segcam = segcam::Segcam::new(video.info.size);
+                let segcam = segcam::Worker::start(video.info.size);
                 self.media = Some(Media {
                     segcam,
                     sound: self
@@ -357,10 +357,11 @@ impl Preview {
         let controls = self.exprs.apply(&self.controls, &self.sources, dt as f32);
         self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(media) = &mut self.media
-            && let Some(pixels) = media.segcam.output(segcam::settings(&controls))
-        {
-            self.effects.write_source(&self.gpu, pixels);
+        if let Some(media) = &self.media {
+            media.segcam.set(segcam::settings(&controls));
+            if let Some(pixels) = media.segcam.take() {
+                self.effects.write_source(&self.gpu, &pixels);
+            }
         }
         self.effects.render(&self.gpu, &controls, self.time, false);
     }

@@ -90,10 +90,11 @@ impl Export {
             );
             let controls = exprs.apply(base, &sources, dt);
             self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
-            self.segcam.push(pixels);
+            let settings = segcam::settings(&controls);
+            self.segcam.push(pixels, settings.as_ref());
             let source = self
                 .segcam
-                .output(segcam::settings(&controls))
+                .output(settings)
                 .expect("a new frame is always shown");
             effects.write_source(gpu, source);
             let out = effects
