@@ -71,6 +71,7 @@ struct Instance {
     output: gl::Texture,
     #[cfg(target_os = "macos")]
     interop: Option<surface::Interop>,
+    #[cfg(target_os = "macos")]
     /// Set once the zero-copy path has failed to set up, so it isn't retried per frame.
     interop_failed: bool,
 }
@@ -85,6 +86,7 @@ impl Instance {
             output: gl::Texture::new(),
             #[cfg(target_os = "macos")]
             interop: None,
+            #[cfg(target_os = "macos")]
             interop_failed: std::env::var("VFX_FFGL_PATH").as_deref() == Ok("ram"),
         }
     }
@@ -208,6 +210,11 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
             // SAFETY: the host passes a viewport and has its context current.
             let viewport = unsafe { input.ptr.cast::<FFGLViewportStruct>().as_ref() };
             if viewport.is_none() {
+                return FFMixed::fail();
+            }
+            #[cfg(target_os = "windows")]
+            if let Err(e) = gl::load() {
+                LOG.note(&format!("warning: {e}"));
                 return FFMixed::fail();
             }
             let mut instance = Instance::new();

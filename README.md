@@ -7,8 +7,8 @@ for several hosts:
 |---|---|---|---|
 | Core library | `vfx-core` (repo root) | any Rust app | tested headless on macOS, Windows, Linux |
 | After Effects | `wrappers/adobe` | After Effects 2026 (Premiere untested) | tested in AE; SmartFX, 8/16/32 bpc, Multi-Frame Rendering, GPU-native on Metal |
-| OpenFX | `wrappers/ofx` | DaVinci Resolve, Nuke, Natron… | passes a mini host; loads in Resolve 21 (the Mac App Store build hides third-party OpenFX) |
-| FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17; zero-copy on macOS via IOSurface |
+| OpenFX | `wrappers/ofx` | DaVinci Resolve, Nuke, Natron… | passes a mini host on macOS and Windows; loads in Resolve 21 on macOS (the Mac App Store build hides third-party OpenFX); renders in Natron 2.5 on Windows |
+| FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17 on macOS; zero-copy via IOSurface; passes the mini host on Windows through RAM |
 | Preview app | `examples/preview` | desktop and browser (WebGPU) | egui control panel; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 
 Every target renders the same effect chain through the same code, so a frame looks the
@@ -70,12 +70,15 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin wasm32-unknown-unknow
 | Preview (web) | `examples/preview/web/build.sh --serve` | http://localhost:8123 (needs `wasm-bindgen-cli` at the lockfile's version) |
 | After Effects | `wrappers/adobe/package-mac.sh` | `target/vfx-plugin/VfxAdobe.pkg` → installs to Adobe's MediaCore folder |
 | OpenFX | `wrappers/ofx/package-mac.sh` | `target/vfx-plugin/VfxPreview-ofx.pkg` → installs to `/Library/OFX/Plugins` |
+| OpenFX (Windows) | `wrappers/ofx/bundle-win.sh --install` | `VfxPreview.ofx.bundle` → `C:\Program Files\Common Files\OFX\Plugins` (run from Git Bash as administrator) |
 | Resolume | `wrappers/ffgl/bundle-mac.sh --install` | copies `VfxPreview.bundle` into `~/Documents/Resolume Avenue/Extra Effects` |
+| Resolume (Windows) | `wrappers/ffgl/bundle-win.sh --install` | copies `VfxPreview.dll` into the existing Resolume Documents folders (run from Git Bash) |
 
 The `.pkg` scripts sign and notarize only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
 `INSTALLER_IDENTITY` are set; without them the packages are unsigned (fine locally).
 Each plugin writes one-line notes about which render path ran to
-`~/Library/Logs/VfxAdobe.log`, `VfxOfx.log` or `VfxFfgl.log`.
+`~/Library/Logs/VfxAdobe.log`, `VfxOfx.log` or `VfxFfgl.log` (on Windows, the same names
+in `%TEMP%`).
 
 ## Testing
 
@@ -88,16 +91,23 @@ those, each host has its own harness:
   minute. See its README. Needs After Effects, so it isn't in CI.
 - **OpenFX**: `wrappers/ofx/minihost/run.sh` loads the plugin into a C host built on the
   real OpenFX headers and checks pixels, depths, row order, premultiplication, render
-  scale, regions of definition and interest. Runs in CI.
+  scale, regions of definition and interest. Runs in CI on macOS and Windows. On Windows,
+  run it from Git Bash with `CC` and `OFX_INCLUDE` set (CI uses clang and the headers
+  from the OpenFX repository).
 - **FFGL**: `wrappers/ffgl/minihost/run.sh` does the same for FFGL with a headless OpenGL
   context: metadata, pixels, padded textures, GL state left behind, and frame times.
-  `FFGL_MINIHOST_SOFTWARE=1` uses Apple's software renderer, as on CI runners. Runs in CI.
+  `FFGL_MINIHOST_SOFTWARE=1` uses Apple's software renderer, as on macOS CI runners.
+  Runs in CI on macOS. On Windows, run from Git Bash with `CC` set; the GPU host runs
+  locally, while CI runs unit tests and builds the DLL.
 
 ## Design notes
 
 - **One device per plugin, chains pooled.** Building pipelines is the expensive part of
   a render, so prepared chains are kept per (device, size, stages) and leased per render.
   Concurrent renders (After Effects MFR, OpenFX hosts) each lease their own.
+- **No OpenGL backend for plugins.** Headless devices use Vulkan, Metal or DX12. wgpu's
+  OpenGL backend releases whatever context is current when it starts, which on Windows
+  is the FFGL host's. The preview creates its own instance.
 - **GPU-native paths where hosts allow it.** After Effects with Metal acceleration hands
   over `MTLBuffer`s: the plugin opens wgpu on After Effects' own device and wraps them.
   Resolume's GL textures are drawn into IOSurfaces that wgpu's Metal device shares. Both
@@ -113,8 +123,12 @@ those, each host has its own harness:
 
 ## Known gaps
 
-- Windows: the After Effects `.aex` builds in CI but hasn't been tested in After Effects;
-  the OpenFX and FFGL plugins have no Windows build yet.
+- Windows:
+  - After Effects: the `.aex` builds in CI but hasn't been tested in After Effects.
+  - OpenFX: passes the mini host and renders in Natron 2.5, but hasn't been tried in
+    Resolve on Windows yet.
+  - FFGL: passes the mini host through RAM, but has not been tried in Resolume on
+    Windows. GPU-native texture sharing is not done.
 - Premiere Pro is untested. Signing and notarization have never been run.
 - OpenFX GPU rendering (Resolve's Metal extension) and an FFGL thumbnail aren't done.
 - Hosts with no plugin yet: TouchDesigner (a Custom TOP, or the shaders as a GLSL
