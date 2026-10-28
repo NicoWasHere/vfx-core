@@ -183,6 +183,7 @@ static OfxStatus paramGetPropertySet(OfxParamHandle p, OfxPropertySetHandle *pro
 static int components(const ParamRec *p) {
     if (!strcmp(p->type, kOfxParamTypeDouble2D)) return 2;
     if (!strcmp(p->type, kOfxParamTypeRGBA)) return 4;
+    if (!strcmp(p->type, kOfxParamTypeRGB)) return 3;
     return 1;
 }
 
@@ -259,8 +260,15 @@ static OfxStatus clipGetHandle(OfxImageEffectHandle e, const char *name, OfxImag
 static OfxStatus clipGetPropertySet(OfxImageClipHandle c, OfxPropertySetHandle *props) { *props = c->props; return kOfxStatOK; }
 
 static int images_out = 0;
+static OfxPropertySetHandle (*temporal_image)(OfxImageClipHandle, OfxTime) = NULL;
 static OfxStatus clipGetImage(OfxImageClipHandle c, OfxTime t, const OfxRectD *r, OfxPropertySetHandle *image) {
     (void)t; (void)r;
+    if (temporal_image) {
+        *image = temporal_image(c, t);
+        if (!*image) return kOfxStatFailed;
+        images_out++;
+        return kOfxStatOK;
+    }
     if (!c->image) return kOfxStatFailed;
     images_out++;
     *image = c->image;

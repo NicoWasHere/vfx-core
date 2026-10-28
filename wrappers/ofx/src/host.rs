@@ -16,6 +16,10 @@ pub struct Suites {
 static HOST: AtomicPtr<OfxHost> = AtomicPtr::new(ptr::null_mut());
 static SUITES: OnceLock<Suites> = OnceLock::new();
 
+/// Records the host passed before loading the plugin.
+///
+/// # Safety
+/// `host` and its suites must remain valid until the plugin unloads.
 pub unsafe extern "C" fn set_host(host: *mut OfxHost) {
     HOST.store(host, Ordering::Release);
 }
