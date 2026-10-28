@@ -10,17 +10,35 @@
  *                                     blur, scale, premult, vignette, blend, grow, depths
  * Exit status 0 when every check passes.
  */
-#include <dlfcn.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
 #include "ofxParam.h"
 #include "ofxProperty.h"
+
+/* ---- Loading the plugin ----------------------------------------------------------- */
+
+#ifdef _WIN32
+static void *open_plugin(const char *path) { return (void *)LoadLibraryA(path); }
+static void *plugin_symbol(void *lib, const char *name) { return (void *)GetProcAddress((HMODULE)lib, name); }
+static void open_failed(void) { fprintf(stderr, "LoadLibrary failed (error %lu)\n", GetLastError()); }
+#else
+static void *open_plugin(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static void *plugin_symbol(void *lib, const char *name) { return dlsym(lib, name); }
+static void open_failed(void) { fprintf(stderr, "dlopen: %s\n", dlerror()); }
+#endif
 
 /* ---- Property sets ---------------------------------------------------------------- */
 
@@ -626,10 +644,10 @@ static Case cases[] = {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: minihost <plugin.ofx> [case]\n"); return 2; }
-    void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (!lib) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 2; }
-    int (*count)(void) = dlsym(lib, "OfxGetNumberOfPlugins");
-    OfxPlugin *(*getp)(int) = dlsym(lib, "OfxGetPlugin");
+    void *lib = open_plugin(argv[1]);
+    if (!lib) { open_failed(); return 2; }
+    int (*count)(void) = plugin_symbol(lib, "OfxGetNumberOfPlugins");
+    OfxPlugin *(*getp)(int) = plugin_symbol(lib, "OfxGetPlugin");
     if (!count || !getp || count() != 1) { fprintf(stderr, "missing or unexpected OFX entry points\n"); return 2; }
     plugin = getp(0);
     printf("plugin %s %s v%u.%u\n", plugin->pluginApi, plugin->pluginIdentifier, plugin->pluginVersionMajor, plugin->pluginVersionMinor);

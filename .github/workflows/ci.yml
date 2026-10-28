@@ -76,11 +76,27 @@ jobs:
           mkdir -p target/vfx-plugin
           cp target/release/vfx_adobe.dll target/vfx-plugin/VfxAdobe.aex
 
+      # OpenFX on Windows: the same unit tests and mini host as on macOS, the host built
+      # with the runner's clang, then the bundle for Resolve and other OpenFX hosts.
+      - name: OpenFX wrapper tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo test -p vfx-wrapper-common -p vfx-ofx
+          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+          CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" ./wrappers/ofx/minihost/run.sh
+
+      - name: Build Windows OpenFX bundle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./wrappers/ofx/bundle-win.sh
+
       - uses: actions/upload-artifact@v4
         with:
-          name: vfx-adobe-${{ runner.os }}
+          name: vfx-plugins-${{ runner.os }}
           path: |
             target/vfx-plugin/VfxAdobe.pkg
             target/vfx-plugin/VfxAdobe.plugin
             target/vfx-plugin/VfxAdobe.aex
+            target/vfx-plugin/VfxPreview.ofx.bundle
           if-no-files-found: error
