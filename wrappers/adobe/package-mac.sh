@@ -39,6 +39,8 @@ fi
 
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
+# mktemp makes the folder 700, and the payload root's mode becomes the install folder's.
+chmod 755 "$stage"
 # No extended attributes, or the payload gains AppleDouble ._ files.
 ditto --norsrc --noextattr --noqtn "$bundle" "$stage/VfxAdobe.plugin"
 

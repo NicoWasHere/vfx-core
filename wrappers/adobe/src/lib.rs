@@ -5,11 +5,9 @@
 //! 32 bpc keeps values above 1.0. Frames are copied to the GPU and back (the CPU path).
 //! Feedback is left out on purpose, because After Effects may render frames out of order.
 
-mod diag;
 #[cfg(target_os = "macos")]
 mod metal;
 mod params;
-mod pipeline;
 mod pixel;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -20,6 +18,10 @@ use after_effects as ae;
 use params::{Params, Settings};
 use pixel::{Depth, Placement};
 use vfx_core::Gpu;
+use vfx_wrapper_common::{diag, pipeline};
+
+/// Render-path notes, in `~/Library/Logs/VfxAdobe.log`.
+static LOG: diag::Log = diag::Log::new("VfxAdobe.log");
 
 /// One device for the whole plugin, created on first render. `None` if no GPU adapter
 /// could be opened. Renders then pass the image through unchanged rather than fail.
@@ -43,7 +45,7 @@ fn gpu() -> Option<&'static Gpu> {
 /// `ae-tests/`, which compares After Effects' output against it. Not a public API.
 #[doc(hidden)]
 pub mod reference {
-    pub use crate::params::{Blur, Settings, Vignette};
+    pub use vfx_wrapper_common::{Blur, Settings, Vignette};
 
     /// Renders one frame of straight-alpha RGBA f32 pixels the way `render_frame` does
     /// for a layer whose buffer lines up with the output. `None` without a GPU.
@@ -55,7 +57,7 @@ pub mod reference {
         layer: Option<&[f32]>,
         time: f64,
     ) -> Option<Vec<f32>> {
-        let job = crate::pipeline::Job {
+        let job = vfx_wrapper_common::pipeline::Job {
             settings,
             width,
             height,
@@ -64,12 +66,12 @@ pub mod reference {
             canvas_origin: [0.0, 0.0],
             time,
         };
-        Some(crate::pipeline::run(crate::gpu()?, &job))
+        Some(vfx_wrapper_common::pipeline::run(crate::gpu()?, &job))
     }
 }
 
 fn warn_once(message: &str) {
-    diag::note(&format!("warning: {message}"));
+    LOG.note(&format!("warning: {message}"));
     if !WARNED.swap(true, Ordering::Relaxed) {
         ae::log::error!("VFX Preview: {message}");
     }
@@ -149,7 +151,7 @@ fn gpu_device_setup(
         .and_then(|info| unsafe { metal::AeDevice::open(info.devicePV, index) });
     match opened {
         Ok(device) => {
-            diag::note(&format!(
+            LOG.note(&format!(
                 "Metal device {index} opened for GPU-native rendering"
             ));
             extra.set_gpu_data(device);
@@ -216,14 +218,14 @@ fn smart_render_gpu(
         })
     };
     let result = (|| {
-        let settings = Settings::read(params, in_data)?;
+        let settings = params::read_settings(params, in_data)?;
         let input = wrap(&mut input)?;
         let layer = layer.as_mut().map(&mut wrap).transpose()?;
         let output = wrap(&mut output)?;
         if output.width == 0 || output.height == 0 {
             return Ok(());
         }
-        diag::note("render path: GPU-native (After Effects' Metal buffers, 32 bpc float)");
+        LOG.note("render path: GPU-native (After Effects' Metal buffers, 32 bpc float)");
         catch_unwind(AssertUnwindSafe(|| {
             metal::render(
                 device,
@@ -252,7 +254,7 @@ fn smart_pre_render(
     in_data: &ae::InData,
     params: &ae::Parameters<Params>,
 ) -> Result<(), ae::Error> {
-    let settings = Settings::read(params, in_data)?;
+    let settings = params::read_settings(params, in_data)?;
     let (reach_x, reach_y) = settings.blur_reach();
     let request = extra.output_request();
 
@@ -318,7 +320,7 @@ fn smart_render(
         .checkout_output()?
         .ok_or(ae::Error::BadCallbackParameter)?;
 
-    let result = Settings::read(params, in_data).and_then(|settings| {
+    let result = params::read_settings(params, in_data).and_then(|settings| {
         render_frame(
             &settings,
             &input,
@@ -355,7 +357,7 @@ fn render_frame(
     time: f64,
 ) -> Result<(), ae::Error> {
     let depth = Depth::from_bits(input.bit_depth()).ok_or(ae::Error::BadCallbackParameter)?;
-    diag::note(&format!("render path: CPU (frames through RAM), {depth:?}"));
+    LOG.note(&format!("render path: CPU (frames through RAM), {depth:?}"));
     if Depth::from_bits(output.bit_depth()) != Some(depth) {
         return Err(ae::Error::BadCallbackParameter);
     }
@@ -503,7 +505,7 @@ impl AdobePluginInstance for Instance {
         in_layer: &ae::Layer,
         out_layer: &mut ae::Layer,
     ) -> Result<(), ae::Error> {
-        let settings = Settings::read(plugin.params, &plugin.in_data)?;
+        let settings = params::read_settings(plugin.params, &plugin.in_data)?;
         let layer = match plugin.params.get(Params::BlendLayer)?.as_param()? {
             ae::Param::Layer(l) => l.value(),
             _ => None,

@@ -4,6 +4,7 @@
 
 use after_effects as ae;
 use vfx_core::effects::{BLEND_MODES, BLUR_DIRECTIONS};
+pub use vfx_wrapper_common::{Blur, Settings, Vignette};
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 pub enum Params {
@@ -167,112 +168,54 @@ fn popup(
     )
 }
 
-/// Everything one frame needs, already converted to the core's units.
-#[derive(Clone, Copy, Debug)]
-pub struct Settings {
-    pub linear: bool,
-    /// Brightness, contrast, saturation, when the stage is on.
-    pub color: Option<[f32; 3]>,
-    pub vignette: Option<Vignette>,
-    pub blend_mode: i32,
-    pub blend_amount: f32,
-    pub blur: Option<Blur>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Vignette {
-    /// Layer pixel coordinates at the current preview resolution.
-    pub center_px: [f32; 2],
-    pub radius: f32,
-    pub softness: f32,
-    pub color: [f32; 4],
-    pub amount: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Blur {
-    /// Horizontal radius in buffer pixels, already scaled for preview downsampling.
-    pub radius: f32,
-    /// Vertical radius ÷ horizontal radius, for uneven downsampling.
-    pub vertical_scale: f32,
-    pub direction: i32,
-    pub grow: bool,
-}
-
-impl Blur {
-    /// Pixels the blur reaches beyond each edge, horizontally and vertically.
-    pub fn reach(&self) -> (i32, i32) {
-        let x = if self.direction == 2 {
-            0.0
+/// Reads one frame's controls into the core's units.
+pub fn read_settings(
+    params: &ae::Parameters<Params>,
+    in_data: &ae::InData,
+) -> Result<Settings, ae::Error> {
+    // Slider values are in full-resolution pixels. At Half, Third or Quarter preview
+    // resolution, After Effects hands us a smaller buffer, so pixel distances shrink
+    // by the same factor.
+    let scale = |r: ae::RationalScale| {
+        if r.den == 0 {
+            1.0
         } else {
-            self.radius
-        };
-        let y = if self.direction == 1 {
-            0.0
-        } else {
-            self.radius * self.vertical_scale
-        };
-        (x.ceil() as i32, y.ceil() as i32)
-    }
-}
+            r.num as f32 / r.den as f32
+        }
+    };
+    let (dx, dy) = (scale(in_data.downsample_x()), scale(in_data.downsample_y()));
 
-impl Settings {
-    pub fn read(params: &ae::Parameters<Params>, in_data: &ae::InData) -> Result<Self, ae::Error> {
-        // Slider values are in full-resolution pixels. At Half, Third or Quarter preview
-        // resolution, After Effects hands us a smaller buffer, so pixel distances shrink
-        // by the same factor.
-        let scale = |r: ae::RationalScale| {
-            if r.den == 0 {
-                1.0
-            } else {
-                r.num as f32 / r.den as f32
-            }
-        };
-        let (dx, dy) = (scale(in_data.downsample_x()), scale(in_data.downsample_y()));
-
-        let color = checkbox_value(params, Params::ColorEnable)?.then_some([
-            float(params, Params::Brightness)?,
-            float(params, Params::Contrast)?,
-            float(params, Params::Saturation)?,
-        ]);
-        let vignette = if checkbox_value(params, Params::VignetteEnable)? {
-            Some(Vignette {
-                center_px: point(params, Params::VignetteCenter)?,
-                radius: float(params, Params::VignetteRadius)?,
-                softness: float(params, Params::VignetteSoftness)?,
-                color: color_value(params, Params::VignetteColor)?,
-                amount: float(params, Params::VignetteAmount)?,
-            })
-        } else {
-            None
-        };
-        let blur_radius = float(params, Params::BlurRadius)? * dx;
-        let blur =
-            (checkbox_value(params, Params::BlurEnable)? && blur_radius > 0.0).then_some(Blur {
-                radius: blur_radius,
-                vertical_scale: if dx > 0.0 { dy / dx } else { 1.0 },
-                direction: popup_value(params, Params::BlurDirection)?,
-                grow: checkbox_value(params, Params::BlurGrow)?,
-            });
-        Ok(Self {
-            linear: checkbox_value(params, Params::LinearLight)?,
-            color,
-            vignette,
-            blend_mode: popup_value(params, Params::BlendMode)?,
-            blend_amount: float(params, Params::BlendAmount)?,
-            blur,
+    let color = checkbox_value(params, Params::ColorEnable)?.then_some([
+        float(params, Params::Brightness)?,
+        float(params, Params::Contrast)?,
+        float(params, Params::Saturation)?,
+    ]);
+    let vignette = if checkbox_value(params, Params::VignetteEnable)? {
+        Some(Vignette {
+            center_px: point(params, Params::VignetteCenter)?,
+            radius: float(params, Params::VignetteRadius)?,
+            softness: float(params, Params::VignetteSoftness)?,
+            color: color_value(params, Params::VignetteColor)?,
+            amount: float(params, Params::VignetteAmount)?,
         })
-    }
-
-    /// How far the blur reads past each edge; (0, 0) without blur.
-    pub fn blur_reach(&self) -> (i32, i32) {
-        self.blur.map_or((0, 0), |b| b.reach())
-    }
-
-    /// Whether the output should extend past the input's bounds.
-    pub fn grows(&self) -> bool {
-        self.blur.is_some_and(|b| b.grow)
-    }
+    } else {
+        None
+    };
+    let blur_radius = float(params, Params::BlurRadius)? * dx;
+    let blur = (checkbox_value(params, Params::BlurEnable)? && blur_radius > 0.0).then_some(Blur {
+        radius: blur_radius,
+        vertical_scale: if dx > 0.0 { dy / dx } else { 1.0 },
+        direction: popup_value(params, Params::BlurDirection)?,
+        grow: checkbox_value(params, Params::BlurGrow)?,
+    });
+    Ok(Settings {
+        linear: checkbox_value(params, Params::LinearLight)?,
+        color,
+        vignette,
+        blend_mode: popup_value(params, Params::BlendMode)?,
+        blend_amount: float(params, Params::BlendAmount)?,
+        blur,
+    })
 }
 
 fn float(params: &ae::Parameters<Params>, id: Params) -> Result<f32, ae::Error> {

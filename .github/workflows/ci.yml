@@ -53,6 +53,17 @@ jobs:
       - name: Wrapper tests (pixel conversion, pipeline, Metal interop on macOS)
         run: cargo test -p vfx-adobe --lib
 
+      # OpenFX and FFGL: unit tests, then each plugin in its minimal host. The OpenFX
+      # host needs the OpenFX headers (from the official repository); the FFGL host
+      # needs an OpenGL context, which macOS runners provide.
+      - name: OpenFX and FFGL wrapper tests
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p vfx-wrapper-common -p vfx-ofx -p vfx-ffgl
+          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+          OFX_INCLUDE="$RUNNER_TEMP/openfx/include" ./wrappers/ofx/minihost/run.sh
+          ./wrappers/ffgl/minihost/run.sh
+
       - name: Build macOS bundle and installer
         if: runner.os == 'macOS'
         run: ./wrappers/adobe/package-mac.sh

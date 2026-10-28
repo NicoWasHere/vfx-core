@@ -14,7 +14,7 @@ use vfx_core::Gpu;
 use vfx_core::wgpu::{self, hal};
 
 use crate::params::Settings;
-use crate::pipeline::{FRAME_FORMAT, Lease, Spec};
+use vfx_wrapper_common::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 /// Bytes per pixel in After Effects' GPU worlds (`PF_PixelFormat_GPU_BGRA128`).
 pub const BYTES_PER_PIXEL: usize = 16;

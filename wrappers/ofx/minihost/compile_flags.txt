@@ -1,0 +1,2 @@
+-std=c11
+-I/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/OpenFX/OpenFX-1.4/include

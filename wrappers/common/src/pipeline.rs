@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use vfx_core::effects::{Blend, ColorAdjust, GaussianBlur, PixelConvert, Vignette};
 use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
 
-use crate::params::Settings;
+use crate::Settings;
 
 /// Render format. Float keeps HDR values intact. 8- and 16-bit input is converted on the CPU.
 pub const FRAME_FORMAT: vfx_core::wgpu::TextureFormat = vfx_core::wgpu::TextureFormat::Rgba32Float;
@@ -320,7 +320,7 @@ fn build(gpu: &Gpu, key: Key) -> Prepared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Blur, Settings};
+    use crate::{Blur, Settings};
 
     fn gpu() -> Gpu {
         pollster::block_on(Gpu::headless()).expect("no GPU adapter available for tests")

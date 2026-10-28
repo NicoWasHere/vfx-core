@@ -1,0 +1,22 @@
+[package]
+name = "vfx-ffgl"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vfx-core = { path = "../.." }
+vfx-wrapper-common = { path = "../common" }
+pollster = "1.0.1"
+
+# Zero-copy frames on macOS: IOSurfaces shared between the host's OpenGL context and
+# the plugin's Metal device. Same objc2 versions wgpu uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLTypes", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFBase"] }

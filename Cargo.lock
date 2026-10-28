@@ -1081,6 +1081,7 @@ dependencies = [
  "block2",
  "objc2",
  "objc2-foundation",
+ "objc2-io-surface",
 ]
 
 [[package]]
@@ -1872,6 +1873,7 @@ dependencies = [
  "pipl",
  "pollster",
  "vfx-core",
+ "vfx-wrapper-common",
 ]
 
 [[package]]
@@ -1884,6 +1886,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfx-ffgl"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-io-surface",
+ "objc2-metal",
+ "pollster",
+ "vfx-core",
+ "vfx-wrapper-common",
+]
+
+[[package]]
+name = "vfx-ofx"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "vfx-core",
+ "vfx-wrapper-common",
+]
+
+[[package]]
 name = "vfx-preview"
 version = "0.1.0"
 dependencies = [
@@ -1892,6 +1916,15 @@ dependencies = [
  "vfx-core",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "vfx-wrapper-common"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "vfx-core",
 ]
 
 [[package]]
