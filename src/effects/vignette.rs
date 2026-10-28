@@ -41,7 +41,9 @@ const PARAMS: &[ParamSpec] = &[
 ];
 
 // Distance is measured in pixels and divided by half the frame diagonal, so radius 1.0
-// reaches the corners from the centre whatever the frame size or aspect.
+// reaches the corners from the centre whatever the frame size or aspect. The fade ends
+// at the radius (fully the colour from there out) and starts `softness` inside it, so
+// radius 0 covers the whole frame.
 const WGSL: &str = r#"
 struct U {
     a: vec4<f32>, // xy: centre (normalised), z: radius, w: softness
@@ -55,7 +57,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let c = textureLoad(src, vec2<i32>(pos.xy), 0);
     let size = vec2<f32>(textureDimensions(src));
     let d = length(pos.xy - u.a.xy * size) / (0.5 * length(size));
-    let t = smoothstep(u.a.z, u.a.z + max(u.a.w, 1e-4), d) * u.b.a;
+    let t = smoothstep(u.a.z - max(u.a.w, 1e-4), u.a.z, d) * u.b.a;
     return vec4<f32>(mix(c.rgb, u.b.rgb, t), c.a);
 }
 "#;

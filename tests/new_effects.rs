@@ -83,22 +83,48 @@ fn vignette_leaves_centre_and_tints_corners() {
         &white,
         None,
         &[
-            ("radius", ParamValue::Float(0.2)),
+            ("radius", ParamValue::Float(0.5)),
             ("softness", ParamValue::Float(0.3)),
             ("color", ParamValue::Color([1.0, 0.0, 0.0, 1.0])),
         ],
     );
     let centre = out[(4 * w + 4) as usize];
     let corner = out[0];
+    // The centre sits inside radius - softness, where the fade hasn't started.
     assert!(
         close(centre, [1.0, 1.0, 1.0, 1.0], 1e-6),
         "centre {centre:?}"
     );
-    // Corner sits past radius + softness, so it is the full vignette colour.
+    // Corner sits past the radius, so it is the full vignette colour.
     assert!(
         close(corner, [1.0, 0.0, 0.0, 1.0], 1e-6),
         "corner {corner:?}"
     );
+}
+
+#[test]
+fn vignette_radius_zero_covers_the_frame() {
+    let gpu = gpu();
+    let (w, h) = (9u32, 9u32);
+    let white = vec![[1.0, 1.0, 1.0, 1.0]; (w * h) as usize];
+    let out = run(
+        &gpu,
+        Vignette::default(),
+        (w, h),
+        &white,
+        None,
+        &[
+            ("radius", ParamValue::Float(0.0)),
+            ("softness", ParamValue::Float(0.5)),
+            ("color", ParamValue::Color([1.0, 0.0, 0.0, 1.0])),
+        ],
+    );
+    for (i, pixel) in out.iter().enumerate() {
+        assert!(
+            close(*pixel, [1.0, 0.0, 0.0, 1.0], 1e-6),
+            "pixel {i}: {pixel:?}"
+        );
+    }
 }
 
 #[test]
