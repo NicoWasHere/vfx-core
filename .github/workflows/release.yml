@@ -1,0 +1,115 @@
+name: release
+
+# Builds every plugin on GitHub's macOS and Windows runners. Pushing a version tag
+# (v1.2.3) puts the files on a draft release to check and publish; running it by hand
+# (Actions → release → Run workflow) leaves them as the run's artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    env:
+      # Signing and notarization run only when these secrets are set (README: Releases).
+      MACOS_CERTIFICATES_P12: ${{ secrets.MACOS_CERTIFICATES_P12 }}
+      MACOS_CERTIFICATES_PASSWORD: ${{ secrets.MACOS_CERTIFICATES_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # The package scripts sign when SIGN_IDENTITY and INSTALLER_IDENTITY are set and
+      # notarize when NOTARY_PROFILE is; this puts the certificates in a keychain for them.
+      - name: Signing keychain
+        if: env.MACOS_CERTIFICATES_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$MACOS_CERTIFICATES_P12" | base64 --decode > "$RUNNER_TEMP/certificates.p12"
+          security import "$RUNNER_TEMP/certificates.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATES_PASSWORD" -T /usr/bin/codesign -T /usr/bin/pkgbuild
+          rm "$RUNNER_TEMP/certificates.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$keychain"
+          identity() { security find-identity -v "$keychain" | grep -o "\"$1: [^\"]*\"" | head -1 | tr -d '"'; }
+          echo "SIGN_IDENTITY=$(identity 'Developer ID Application')" >> "$GITHUB_ENV"
+          echo "INSTALLER_IDENTITY=$(identity 'Developer ID Installer')" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ]; then
+            xcrun notarytool store-credentials vfx-notary --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            echo "NOTARY_PROFILE=vfx-notary" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build the installers
+        run: |
+          ./wrappers/adobe/package-mac.sh
+          ./wrappers/ofx/package-mac.sh
+          ./wrappers/ffgl/bundle-mac.sh
+          name="VfxPreview-${VERSION#v}-macOS"
+          mkdir -p dist
+          cp target/vfx-plugin/VfxAdobe.pkg "dist/$name-AfterEffects.pkg"
+          cp target/vfx-plugin/VfxPreview-ofx.pkg "dist/$name-OpenFX.pkg"
+          ditto -c -k --keepParent target/vfx-plugin/VfxPreview.bundle "dist/$name-Resolume.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macOS
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the plugins, the installer and the zip
+        shell: bash
+        run: VERSION="${VERSION#v}" ./wrappers/package-win.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-Windows
+          path: |
+            target/vfx-plugin/*-Windows-Setup.exe
+            target/vfx-plugin/*-Windows.zip
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --draft --title "$GITHUB_REF_NAME" --generate-notes
