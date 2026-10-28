@@ -72,9 +72,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          . ./plugin.env
           cargo build -p vfx-adobe --release
           mkdir -p target/vfx-plugin
-          cp target/release/vfx_adobe.dll target/vfx-plugin/VfxAdobe.aex
+          cp target/release/vfx_adobe.dll "target/vfx-plugin/$PLUGIN_FILE.aex"
 
       # OpenFX on Windows: the same unit tests and mini host as on macOS, the host built
       # with the runner's clang, then the bundle for Resolve and other OpenFX hosts.
@@ -105,9 +106,9 @@ jobs:
         with:
           name: vfx-plugins-${{ runner.os }}
           path: |
-            target/vfx-plugin/VfxAdobe.pkg
-            target/vfx-plugin/VfxAdobe.plugin
-            target/vfx-plugin/VfxAdobe.aex
-            target/vfx-plugin/VfxPreview.ofx.bundle
-            target/vfx-plugin/VfxPreview.dll
+            target/vfx-plugin/*.pkg
+            target/vfx-plugin/*.plugin
+            target/vfx-plugin/*.aex
+            target/vfx-plugin/*.ofx.bundle
+            target/vfx-plugin/*.dll
           if-no-files-found: error

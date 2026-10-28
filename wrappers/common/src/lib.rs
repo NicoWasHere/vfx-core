@@ -7,3 +7,15 @@ pub mod pipeline;
 mod settings;
 
 pub use settings::{Blur, Settings, Vignette};
+
+/// A value from plugin.env as a C string, at compile time. The wrapper's build.rs sets
+/// the variables (`VFX_PLUGIN_NAME` and so on) by including `plugin_env.rs`.
+#[macro_export]
+macro_rules! plugin_cstr {
+    ($var:literal) => {
+        match ::std::ffi::CStr::from_bytes_with_nul(concat!(env!($var), "\0").as_bytes()) {
+            Ok(s) => s,
+            Err(_) => panic!(concat!($var, " contains a NUL byte")),
+        }
+    };
+}

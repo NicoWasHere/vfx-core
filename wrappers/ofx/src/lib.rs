@@ -1,4 +1,4 @@
-//! OpenFX wrapper for vfx-core: the same "VFX Preview" effect as the After Effects
+//! OpenFX wrapper for vfx-core: the same effect as the After Effects
 //! plugin, for OpenFX hosts such as DaVinci Resolve, Nuke and Natron.
 //!
 //! Frames go through RAM: the source image is read into a straight-alpha f32 canvas,
@@ -23,7 +23,7 @@ use ffi::*;
 use host::{Props, check, suites};
 use image::{Depth, Image, Rect};
 
-static LOG: diag::Log = diag::Log::new("VfxOfx.log");
+static LOG: diag::Log = diag::Log::new(concat!(env!("VFX_PLUGIN_FILE"), "-OpenFX.log"));
 
 /// One device for the whole plugin, created on first render. `None` without a GPU;
 /// renders then pass the image through.
@@ -45,7 +45,7 @@ fn gpu() -> Option<&'static Gpu> {
 static PLUGIN: OfxPlugin = OfxPlugin {
     pluginApi: IMAGE_EFFECT_PLUGIN_API.as_ptr(),
     apiVersion: 1,
-    pluginIdentifier: c"com.vfx-core.VfxPreview".as_ptr(),
+    pluginIdentifier: vfx_wrapper_common::plugin_cstr!("VFX_PLUGIN_ID").as_ptr(),
     pluginVersionMajor: 1,
     pluginVersionMinor: 0,
     setHost: host::set_host,
@@ -144,13 +144,16 @@ pub(crate) fn optional(name: &CStr, result: Result<(), OfxStatus>) {
 
 fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
     let p = effect_props(effect)?;
-    p.set_string(PROP_LABEL, "VFX Preview")?;
+    p.set_string(PROP_LABEL, env!("VFX_PLUGIN_NAME"))?;
     p.set_strs(PROP_SUPPORTED_CONTEXTS, &[CONTEXT_FILTER, CONTEXT_GENERAL])?;
     p.set_strs(
         PROP_SUPPORTED_PIXEL_DEPTHS,
         &[DEPTH_BYTE, DEPTH_SHORT, DEPTH_FLOAT],
     )?;
-    optional(PROP_GROUPING, p.set_string(PROP_GROUPING, "vfx-core"));
+    optional(
+        PROP_GROUPING,
+        p.set_string(PROP_GROUPING, env!("VFX_PLUGIN_CATEGORY")),
+    );
     // DaVinci Resolve 21 rejects this one with kOfxStatErrUnknown.
     optional(
         PROP_PLUGIN_DESCRIPTION,

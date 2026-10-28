@@ -1,11 +1,20 @@
 use pipl::{OutFlags, OutFlags2, PIPLType, Property, Stage};
 
+include!("../common/plugin_env.rs");
+
+/// The names After Effects shows and matches the effect by, from plugin.env.
+struct Names {
+    name: &'static str,
+    category: &'static str,
+    match_name: &'static str,
+}
+
 /// Plugin description read by After Effects: the PiPL resource.
-fn properties() -> Vec<Property> {
+fn properties(names: &Names) -> Vec<Property> {
     vec![
         Property::Kind(PIPLType::AEEffect),
-        Property::Name("VFX Preview"),
-        Property::Category("vfx-core"),
+        Property::Name(names.name),
+        Property::Category(names.category),
         Property::CodeWin64X86("EffectMain"),
         Property::CodeMacIntel64("EffectMain"),
         Property::CodeMacARM64("EffectMain"),
@@ -41,7 +50,7 @@ fn properties() -> Vec<Property> {
                 | OutFlags2::SupportsGetFlattenedSequenceData
                 | gpu_flag(),
         ),
-        Property::AE_Effect_Match_Name("VFXPreview"),
+        Property::AE_Effect_Match_Name(names.match_name),
     ]
 }
 
@@ -55,12 +64,22 @@ fn gpu_flag() -> OutFlags2 {
 }
 
 fn main() {
+    let values = plugin_env();
+    // The PiPL needs 'static strings; a build script runs once, so leaking is fine.
+    let value = |key| -> &'static str { plugin_value(&values, key).to_owned().leak() };
+    let names = Names {
+        name: value("PLUGIN_NAME"),
+        category: value("PLUGIN_CATEGORY"),
+        match_name: value("AE_MATCH_NAME"),
+    };
+
     // Sets the PIPL_* env vars that the after-effects crate reads at compile time.
-    pipl::plugin_build(properties());
+    pipl::plugin_build(properties(&names));
 
     // Also writes the PiPL as a classic resource file, which the macOS bundle needs.
-    let bytes = pipl::build_pipl(properties()).expect("build PiPL");
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("VfxAdobe.rsrc");
+    let bytes = pipl::build_pipl(properties(&names)).expect("build PiPL");
+    let rsrc = format!("{}.rsrc", value("PLUGIN_FILE"));
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join(rsrc);
     pipl::produce_resource(&bytes, out.to_str());
     // Fields the after-effects macro reads at compile time. Neither has a value to set yet.
     println!("cargo:rustc-env=PIPL_AE_RESERVED=0");

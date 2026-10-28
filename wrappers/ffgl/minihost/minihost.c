@@ -13,6 +13,10 @@
  * Exit status 0 when every check passes.
  */
 #define GL_SILENCE_DEPRECATION
+#ifndef PLUGIN_NAME
+#define PLUGIN_NAME "VFX Preview" /* run.sh passes the one in plugin.env */
+#endif
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -318,7 +322,7 @@ static void *instantiate(int w, int h) {
     Viewport v = {0, 0, (GLuint)w, (GLuint)h};
     FFMixed r = call(INSTANTIATE_GL, ptr(&v), NULL);
     if (!r.p || (uintptr_t)r.p == FF_FAIL) {
-        fprintf(stderr, "instantiate failed (see VfxFfgl.log)\n");
+        fprintf(stderr, "instantiate failed (see the plugin's FFGL log)\n");
         exit(2);
     }
     double t = 0;
@@ -353,7 +357,7 @@ static void case_context(void) {
 static void case_info(void) {
     PluginInfo *info = call(GET_INFO, u(0), NULL).p;
     CHECK(info && info->major == 2 && info->minor >= 1, "API version %u.%u", info ? info->major : 0, info ? info->minor : 0);
-    CHECK(info && !strncmp(info->name, "VFX Preview", 11), "plugin name");
+    CHECK(info && !strncmp(info->name, PLUGIN_NAME, sizeof info->name), "plugin name");
     CHECK(info && info->type == 0, "plugin type is effect");
     CHECK(call(GET_PLUGIN_CAPS, u(10), NULL).u == 1 && call(GET_PLUGIN_CAPS, u(11), NULL).u == 1, "one input");
     uint32_t n = call(GET_NUM_PARAMETERS, u(0), NULL).u;

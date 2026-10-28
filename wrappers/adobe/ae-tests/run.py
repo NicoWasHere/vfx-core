@@ -35,7 +35,19 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 AE_APP = "Adobe After Effects 2026"
 AERENDER = Path(f"/Applications/{AE_APP}/aerender")
-PLUGIN_LOG = Path.home() / "Library/Logs/VfxAdobe.log"
+def plugin_env():
+    """The plugin's names and IDs, from plugin.env at the repository root."""
+    values = {}
+    for line in (ROOT / "plugin.env").read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, rest = line.split("=", 1)
+            values[key.strip()] = rest.strip().split('"')[1]
+    return values
+
+
+PLUGIN = plugin_env()
+PLUGIN_LOG = Path.home() / f"Library/Logs/{PLUGIN['PLUGIN_FILE']}-AfterEffects.log"
 FPS = 30
 
 
@@ -234,7 +246,7 @@ function build(v) {
             m.property("ADBE Mask Shape").setValue(s);
         }
         for (var e = 0; e < c.effects.length; e++) {
-            var fx = layer.property("ADBE Effect Parade").addProperty("VFXPreview");
+            var fx = layer.property("ADBE Effect Parade").addProperty("%(match_name)s");
             for (var name in c.effects[e]) {
                 setParam(fx, name, c.effects[e][name]);
             }
@@ -287,7 +299,7 @@ def build_fixtures(out, cases, variants, footage):
     for v in variants:
         (out / v.name).mkdir(parents=True, exist_ok=True)
     script = out / "fixtures.jsx"
-    script.write_text(JSX % {"spec": json.dumps(spec), "fps": FPS})
+    script.write_text(JSX % {"spec": json.dumps(spec), "fps": FPS, "match_name": PLUGIN["AE_MATCH_NAME"]})
     subprocess.run(
         ["osascript", "-e",
          f'with timeout of 900 seconds\n'

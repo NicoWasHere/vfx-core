@@ -1,6 +1,6 @@
 # After Effects test harness
 
-Renders the VFX Preview plugin inside After Effects and checks the frames. It covers
+Renders the plugin inside After Effects and checks the frames. It covers
 the paths that unit tests can't reach: After Effects' parameter handling, SmartFX
 rectangles, bit depths, downsampling, masks, Multi-Frame Rendering and the
 GPU-native Metal path.
@@ -39,7 +39,7 @@ Narrow it with `--cases blur,hdr` and `--variants 32bpc-gpu`.
 | gpu vs cpu | the GPU-native and CPU paths differ by at most 1 level |
 | mfr on vs off | frames are identical with Multi-Frame Rendering on and off |
 | half | Half resolution is within a mean of 4 levels of Full, downsampled |
-| path | the plugin log (`~/Library/Logs/VfxAdobe.log`) shows the expected render path |
+| path | the plugin log (`~/Library/Logs/VfxPreview-AfterEffects.log`) shows the expected render path |
 | per-case checks | `checks.py`: blur past masks, Blur Edges, symmetry, 32 bpc headroom |
 
 Results are in `target/ae-tests/`: `report.txt`, `report.json`, and for each failure
