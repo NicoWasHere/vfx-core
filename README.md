@@ -196,6 +196,8 @@ those, each host has its own harness:
   and reinstall first (installing to system folders needs the user's password).
 - Effect logic belongs in `src/effects`; anything two plugins share belongs in
   `wrappers/common`. Wrappers should only translate parameters and move pixels.
+- Keep parameter names under 16 characters: FFGL hosts cut longer ones, and a test in
+  `wrappers/ffgl/src/params.rs` fails on them.
 - Keep parameter names, defaults and ranges identical across the After Effects
   (`adobe/src/params.rs`), OpenFX (`ofx/src/params.rs`), FFGL (`ffgl/src/params.rs`) and
   preview (`examples/preview/src/controls.rs`) panels.

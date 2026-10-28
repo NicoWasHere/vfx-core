@@ -62,7 +62,7 @@ pub fn setup(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
     slider(
         params,
         Params::VignetteSoftness,
-        "Vignette Softness",
+        "Vignette Soft",
         0.0,
         2.0,
         0.5,

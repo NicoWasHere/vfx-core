@@ -379,7 +379,7 @@ def reference_block(case, frame, files, output):
     if p["Vignette"]:
         cx, cy = p["Vignette Center"] or (width / 2, height / 2)
         r, g, b, a = p["Vignette Color"]
-        lines.append(f"vignette {cx} {cy} {p['Vignette Radius']} {p['Vignette Softness']} "
+        lines.append(f"vignette {cx} {cy} {p['Vignette Radius']} {p['Vignette Soft']} "
                      f"{r} {g} {b} {a} {p['Vignette Amount']}")
     if p["Blur"]:
         lines.append(f"blur {p['Blur Radius']} 1 {p['Blur Direction']} "
