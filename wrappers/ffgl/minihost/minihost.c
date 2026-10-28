@@ -28,6 +28,9 @@
 /* Windows ships GL 1.1 headers. Declare the few newer calls and constants here. */
 #define GL_RGBA32F 0x8814
 #define GL_FRAMEBUFFER 0x8D40
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#define GL_READ_FRAMEBUFFER_BINDING 0x8CAA
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #define GL_CURRENT_PROGRAM 0x8B8D
@@ -406,6 +409,16 @@ static void case_brightness(void) {
     /* The half-transparent band: straight colour is brightened, alpha kept. */
     CHECK(fabsf(px(f.out, 64, 60, 20)[3] - 0.5f) < 1e-4, "alpha changed (%g)", px(f.out, 64, 60, 20)[3]);
     CHECK(fabsf(px(f.out, 64, 60, 20)[0] - (px(f.straight, 64, 60, 20)[0] + 0.25f)) < 1e-3, "half-transparent pixel wrong");
+    /* Float transfers must keep HDR/negative colour and discard colour at zero alpha. */
+    Frame hdr = frame(2, 2, 2, 2);
+    float texels[] = {1.0f, -0.25f, 0.125f, 0.5f, 9, 8, 7, 0,
+                     0, 0, 0, 1, 0.5f, 0.25f, 0, 1};
+    hdr.input = make_texture(2, 2, texels);
+    CHECK(render(inst, &hdr), "HDR process failed");
+    CHECK(fabsf(hdr.out[0] - 2.25f) < 1e-4 && fabsf(hdr.out[1] + 0.25f) < 1e-4,
+          "HDR/negative colour changed: %g, %g", hdr.out[0], hdr.out[1]);
+    CHECK(hdr.out[4] == 0 && hdr.out[5] == 0 && hdr.out[6] == 0 && hdr.out[7] == 0,
+          "transparent pixel retained colour");
     call(DEINSTANTIATE_GL, u(0), inst);
 }
 
@@ -415,6 +428,12 @@ static void case_padding(void) {
     Frame f = frame(50, 40, 64, 64);
     CHECK(render(inst, &f), "process failed");
     CHECK(max_diff(&f) < 1e-4, "padded texture changed the image (max diff %g)", max_diff(&f));
+    /* Reuse one instance across size changes, including rows needing wgpu padding. */
+    Frame odd = frame(37, 29, 64, 32);
+    CHECK(render(inst, &odd), "resized process failed");
+    CHECK(max_diff(&odd) < 1e-4, "resized padded texture changed the image (max diff %g)", max_diff(&odd));
+    CHECK(render(inst, &f), "process after restoring size failed");
+    CHECK(max_diff(&f) < 1e-4, "restored texture changed the image (max diff %g)", max_diff(&f));
     call(DEINSTANTIATE_GL, u(0), inst);
 }
 
@@ -453,13 +472,25 @@ static void case_state(void) {
     void *inst = instantiate(64, 48);
     set(inst, "Blur Radius", 2);
     Frame f = frame(64, 48, 64, 48);
-    render(inst, &f);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, f.target.fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    Texture tex = {64, 48, 64, 48, f.input};
+    Texture *list[1] = {&tex};
+    Process p = {1, list, f.target.fbo};
+    glViewport(3, 5, 50, 35);
+    CHECK(call(PROCESS_OPENGL, ptr(&p), inst).u == 0, "process with offset viewport failed");
+    check_context();
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    CHECK(viewport[0] == 3 && viewport[1] == 5 && viewport[2] == 50 && viewport[3] == 35,
+          "host viewport changed: %d,%d %dx%d", viewport[0], viewport[1], viewport[2], viewport[3]);
     GLint v;
     glGetIntegerv(GL_CURRENT_PROGRAM, &v); CHECK(v == 0, "program %d left bound", v);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &v); CHECK(v == 0, "texture %d left bound", v);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &v); CHECK(v == 0, "vertex array %d left bound", v);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &v); CHECK(v == GL_TEXTURE0, "active texture unit changed");
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &v); CHECK(v == (GLint)f.target.fbo, "host framebuffer unbound");
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &v); CHECK(v == 0, "host read framebuffer changed");
     GLint pack; glGetIntegerv(GL_PACK_ALIGNMENT, &pack); CHECK(pack == 4, "pack alignment %d", pack);
     CHECK(glGetError() == GL_NO_ERROR, "GL error after process");
     call(DEINSTANTIATE_GL, u(0), inst);

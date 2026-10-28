@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 
 use vfx_core::effects::{Blend, ColorAdjust, GaussianBlur, PixelConvert, Vignette};
-use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
+use vfx_core::{EffectChain, Frame, Gpu, ParamValue, Readback};
 
 use crate::Settings;
 
@@ -58,6 +58,7 @@ struct Prepared {
     input: Frame,
     layer: Frame,
     output: Frame,
+    readback: Option<Readback>,
 }
 
 /// What a frame needs, independent of where its pixels live. All buffers are
@@ -166,7 +167,13 @@ pub fn run(gpu: &Gpu, job: &Job) -> Vec<f32> {
         lease.layer().write(gpu, bytemuck::cast_slice(layer));
     }
     lease.render(gpu, job.time);
-    bytemuck::pod_collect_to_vec(&lease.output().read(gpu))
+    let p = lease
+        .prepared
+        .as_mut()
+        .expect("lease holds a chain until dropped");
+    p.readback
+        .get_or_insert_with(|| Readback::new(gpu, &p.output))
+        .read_f32(gpu, &p.output)
 }
 
 /// Copies this frame's values into the chain's stages.
@@ -314,6 +321,7 @@ fn build(gpu: &Gpu, key: Key) -> Prepared {
         input: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
         layer: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
         output: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
+        readback: None,
     }
 }
 
