@@ -14,6 +14,7 @@ use crate::controls::Controls;
 use crate::effects::Effects;
 use crate::face::Detector;
 use crate::modulation::{self, Expressions};
+use crate::segcam::{self, Segcam};
 use crate::video::{Decoder, Encoder, Info};
 
 pub struct Export {
@@ -27,6 +28,7 @@ pub struct Export {
     face: modulation::Face,
     /// Whether the last rendered frame was flipped (x, y), to mirror face values.
     flipped: [bool; 2],
+    segcam: Segcam,
     pub out: PathBuf,
 }
 
@@ -42,6 +44,7 @@ impl Export {
             frame: 0,
             face: modulation::FACE_NONE,
             flipped: [false; 2],
+            segcam: Segcam::new(info.size),
             out,
         })
     }
@@ -87,7 +90,12 @@ impl Export {
             );
             let controls = exprs.apply(base, &sources, dt);
             self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
-            effects.write_source(gpu, &pixels);
+            self.segcam.push(pixels);
+            let source = self
+                .segcam
+                .output(segcam::settings(&controls))
+                .expect("a new frame is always shown");
+            effects.write_source(gpu, source);
             let out = effects
                 .render(gpu, &controls, t, true)
                 .expect("capture returns the frame");

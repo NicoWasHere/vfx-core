@@ -39,6 +39,20 @@ pub struct Controls {
     pub flip_y: f32,
     /// The webcam picked in the Input section.
     pub camera: usize,
+    /// segcam motion, on video and webcam frames before everything else.
+    pub segcam_on: bool,
+    /// Index into segcam's OutputMode::NAMES.
+    pub segcam_mode: usize,
+    /// 0 to 1: how small a change counts as motion.
+    pub segcam_sensitivity: f32,
+    /// Smallest segment, as a percentage of the frame.
+    pub segcam_min_size: f32,
+    pub segcam_background: usize,
+    pub segcam_max_segments: usize,
+    pub segcam_boxes: bool,
+    pub segcam_labels: bool,
+    pub segcam_trail: usize,
+    pub segcam_max_tiles: usize,
 }
 
 impl Default for Controls {
@@ -69,6 +83,16 @@ impl Default for Controls {
             flip_x: 0.0,
             flip_y: 0.0,
             camera: 0,
+            segcam_on: false,
+            segcam_mode: 0,
+            segcam_sensitivity: 0.864,
+            segcam_min_size: 0.25,
+            segcam_background: 16,
+            segcam_max_segments: 16,
+            segcam_boxes: true,
+            segcam_labels: true,
+            segcam_trail: 24,
+            segcam_max_tiles: 100,
         }
     }
 }
@@ -312,6 +336,24 @@ pub fn panel(
             slider(ui, value, range, label);
             modulation::field(ui, exprs, target);
         };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        section(ui, "Segcam motion", Some(&mut c.segcam_on), |ui| {
+            let modes = segcam_motion::OutputMode::NAMES;
+            choice(ui, "segcam mode", &mut c.segcam_mode, &modes);
+            param(ui, &mut c.segcam_sensitivity, 0.0..=1.0, "Sensitivity", target::SEGCAM_SENSITIVITY);
+            param(ui, &mut c.segcam_min_size, 0.0..=10.0, "Min size %", target::SEGCAM_MIN_SIZE);
+            ui.add(egui::Slider::new(&mut c.segcam_background, 1..=60).text("Background frames"));
+            ui.add(egui::Slider::new(&mut c.segcam_max_segments, 1..=64).text("Max segments"));
+            if c.segcam_mode == 3 {
+                ui.add(egui::Slider::new(&mut c.segcam_trail, 1..=60).text("Trail frames"));
+                ui.add(egui::Slider::new(&mut c.segcam_max_tiles, 1..=400).text("Max tiles"));
+            } else {
+                ui.checkbox(&mut c.segcam_boxes, "Boxes");
+                ui.checkbox(&mut c.segcam_labels, "Labels");
+            }
+            ui.label(RichText::new("Video and webcam only; starts over on a seek.").weak());
+        });
 
         section(ui, "Flip", None, |ui| {
             param(ui, &mut c.flip_x, 0.0..=1.0, "Horizontal", target::FLIP_X);

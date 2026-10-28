@@ -94,6 +94,8 @@ pub mod target {
     pub const FEEDBACK_DECAY: usize = 10;
     pub const FLIP_X: usize = 11;
     pub const FLIP_Y: usize = 12;
+    pub const SEGCAM_SENSITIVITY: usize = 13;
+    pub const SEGCAM_MIN_SIZE: usize = 14;
 }
 
 pub const TARGETS: &[Target] = &[
@@ -135,6 +137,12 @@ pub const TARGETS: &[Target] = &[
     },
     Target {
         field: |c| &mut c.flip_y,
+    },
+    Target {
+        field: |c| &mut c.segcam_sensitivity,
+    },
+    Target {
+        field: |c| &mut c.segcam_min_size,
     },
 ];
 

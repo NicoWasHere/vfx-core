@@ -17,6 +17,8 @@ mod export;
 mod face;
 mod modulation;
 #[cfg(not(target_arch = "wasm32"))]
+mod segcam;
+#[cfg(not(target_arch = "wasm32"))]
 mod video;
 
 use std::sync::Arc;
@@ -80,6 +82,8 @@ struct Media {
     export: Option<export::Export>,
     /// While the position slider is being dragged.
     scrub: Option<Scrub>,
+    /// Frames on their way to the GPU, through segcam when it's on.
+    segcam: segcam::Segcam,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -98,6 +102,7 @@ impl Media {
     /// Seeks, playing on or paused there, with the sound following along.
     fn seek(&mut self, position: f64, play: bool, sound_on: bool) -> Result<(), String> {
         self.sound = None;
+        self.segcam.reset();
         self.video.seek(position, play)?;
         if play && sound_on {
             self.sound = video::Sound::play(&self.video.info, self.video.position());
@@ -249,7 +254,9 @@ impl Preview {
             Ok(video) => {
                 self.effects.start_stream(&self.gpu, name, video.info.size);
                 let file = video.info.file();
+                let segcam = segcam::Segcam::new(video.info.size);
                 self.media = Some(Media {
+                    segcam,
                     sound: self
                         .sound_on
                         .then(|| video::Sound::play(&video.info, 0.0))
@@ -290,6 +297,7 @@ impl Preview {
                 media.export = None;
                 self.exprs.reset();
                 self.effects.rebuild_feedback(&self.gpu);
+                media.segcam.redraw();
                 if self.sound_on {
                     media.sound = video::Sound::play(&media.video.info, media.video.position());
                 }
@@ -303,6 +311,7 @@ impl Preview {
                 scrub.pending = None;
                 scrub.last_seek = Instant::now();
                 media.sound = None;
+                media.segcam.reset();
                 if let Err(e) = media.video.seek(position, false) {
                     self.message = Some(e);
                 }
@@ -314,11 +323,12 @@ impl Preview {
                 self.message = Some(e);
             }
 
+            // Uploaded below, once expressions have set segcam's parameters.
             if let Some(pixels) = media.video.take_frame() {
-                self.effects.write_source(&self.gpu, &pixels);
                 if let Some(tracker) = &self.tracker {
-                    tracker.submit(pixels, media.video.info.size);
+                    tracker.submit(pixels.clone(), media.video.info.size);
                 }
+                media.segcam.push(pixels);
             }
             let position = media.video.position();
             self.sources = modulation::sources(
@@ -346,6 +356,12 @@ impl Preview {
 
         let controls = self.exprs.apply(&self.controls, &self.sources, dt as f32);
         self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(media) = &mut self.media
+            && let Some(pixels) = media.segcam.output(segcam::settings(&controls))
+        {
+            self.effects.write_source(&self.gpu, pixels);
+        }
         self.effects.render(&self.gpu, &controls, self.time, false);
     }
 
