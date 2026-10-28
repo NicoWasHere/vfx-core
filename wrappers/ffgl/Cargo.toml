@@ -13,6 +13,9 @@ vfx-core = { path = "../.." }
 vfx-wrapper-common = { path = "../common" }
 pollster = "1.0.1"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+ash = "0.38"
+
 # Zero-copy frames on macOS: IOSurfaces shared between the host's OpenGL context and
 # the plugin's Metal device. Same objc2 versions wgpu uses.
 [target.'cfg(target_os = "macos")'.dependencies]

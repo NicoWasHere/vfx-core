@@ -43,6 +43,35 @@ pub const FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const VIEWPORT: GLenum = 0x0BA2;
 
+#[cfg(target_os = "windows")]
+macro_rules! interop_functions {
+    ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*) => {
+        struct InteropFunctions {
+            $($name: unsafe extern "system" fn($($ty),*) $(-> $ret)?,)*
+        }
+        impl InteropFunctions {
+            unsafe fn load_with(resolve: &mut impl FnMut(&CStr) -> *const c_void) -> Result<Self, String> {
+                Ok(Self {
+                    $($name: {
+                        let name = CStr::from_bytes_with_nul(concat!(stringify!($name), "\0").as_bytes()).unwrap();
+                        let address = resolve(name);
+                        if !valid_address(address) {
+                            return Err(format!("missing OpenGL function {}", name.to_string_lossy()));
+                        }
+                        // SAFETY: the resolver supplies the named function's GL ABI.
+                        unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
+                    },)*
+                })
+            }
+        }
+        $(pub(crate) unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+            let functions = FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().unwrap();
+            // SAFETY: interop loading succeeded; the caller supplies GL arguments.
+            unsafe { (functions.$name)($($arg),*) }
+        })*
+    };
+}
+
 // Keep the signatures in one place; Windows calls use the system GL ABI.
 macro_rules! gl_functions {
     ($( $(#[$attr:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
@@ -72,6 +101,7 @@ macro_rules! gl_functions {
 
             struct Functions {
                 $( $(#[$attr])* $name: unsafe extern "system" fn($($ty),*) $(-> $ret)?, )*
+                interop: Result<InteropFunctions, String>,
             }
             static FUNCTIONS: OnceLock<Result<Functions, String>> = OnceLock::new();
 
@@ -94,8 +124,28 @@ macro_rules! gl_functions {
                             // SAFETY: the resolver supplies this symbol's declared GL ABI.
                             unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
                         }, )*
+                        // SAFETY: the same resolver supplies optional extension entry points.
+                        interop: unsafe { InteropFunctions::load_with(&mut resolve) },
                     })
                 }
+            }
+
+            interop_functions! {
+                fn glCreateMemoryObjectsEXT(n: GLsizei, objects: *mut GLuint);
+                fn glDeleteMemoryObjectsEXT(n: GLsizei, objects: *const GLuint);
+                fn glMemoryObjectParameterivEXT(memory: GLuint, name: GLenum, value: *const GLint);
+                fn glImportMemoryWin32HandleEXT(memory: GLuint, size: u64, kind: GLenum, handle: *mut c_void);
+                fn glTexStorageMem2DEXT(target: GLenum, levels: GLsizei, format: GLenum, w: GLsizei, h: GLsizei, memory: GLuint, offset: u64);
+                fn glGetUnsignedBytevEXT(name: GLenum, value: *mut u8);
+                fn glGenSemaphoresEXT(n: GLsizei, semaphores: *mut GLuint);
+                fn glDeleteSemaphoresEXT(n: GLsizei, semaphores: *const GLuint);
+                fn glImportSemaphoreWin32HandleEXT(semaphore: GLuint, kind: GLenum, handle: *mut c_void);
+                fn glWaitSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
+                fn glSignalSemaphoreEXT(semaphore: GLuint, buffers: GLuint, buffer_names: *const GLuint, textures: GLuint, texture_names: *const GLuint, layouts: *const GLenum);
+            }
+
+            pub(super) fn interop_loaded() -> Result<(), String> {
+                FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().map(|_| ()).map_err(Clone::clone)
             }
 
             /// Loads the table once, with the host's GL context current.
@@ -156,6 +206,17 @@ macro_rules! gl_functions {
                     assert_eq!(load(), Err("no current OpenGL context".into()));
                     assert!(FUNCTIONS.get().is_none());
                 }
+
+                #[test]
+                fn missing_interop_functions_leave_ram_available() {
+                    // SAFETY: only the pointer table is inspected; no function is called.
+                    let functions = unsafe { Functions::load_with(|name| {
+                        if name.to_bytes().ends_with(b"EXT") { std::ptr::null() }
+                        else { 4usize as *const c_void }
+                    }) }.unwrap();
+                    assert_eq!(functions.interop.err().as_deref(),
+                        Some("missing OpenGL function glCreateMemoryObjectsEXT"));
+                }
             }
         }
         #[cfg(target_os = "windows")]
@@ -195,6 +256,10 @@ gl_functions! {
     );
     fn glGetTexImage(target: GLenum, level: GLint, format: GLenum, kind: GLenum, data: *mut c_void);
     fn glPixelStorei(name: GLenum, value: GLint);
+    #[cfg(target_os = "windows")]
+    fn glGetStringi(name: GLenum, index: GLuint) -> *const u8;
+    #[cfg(target_os = "windows")]
+    fn glGetError() -> GLenum;
     fn glCreateShader(kind: GLenum) -> GLuint;
     fn glShaderSource(
         shader: GLuint,
@@ -238,8 +303,78 @@ gl_functions! {
     fn glGetIntegerv(name: GLenum, data: *mut GLint);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glViewport(x: GLint, y: GLint, w: GLsizei, h: GLsizei);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glFinish();
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{
+    glCreateMemoryObjectsEXT, glDeleteMemoryObjectsEXT, glDeleteSemaphoresEXT, glGenSemaphoresEXT,
+    glGetUnsignedBytevEXT, glImportMemoryWin32HandleEXT, glImportSemaphoreWin32HandleEXT,
+    glMemoryObjectParameterivEXT, glSignalSemaphoreEXT, glTexStorageMem2DEXT, glWaitSemaphoreEXT,
+};
+
+/// Checks the optional sharing functions without making them a requirement for RAM.
+#[cfg(target_os = "windows")]
+pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
+    use std::ffi::CStr;
+    let mut count = 0;
+    // SAFETY: the caller has the host's GL 4.1 context current.
+    unsafe {
+        glGetIntegerv(0x821D, &mut count); // GL_NUM_EXTENSIONS
+        for required in [
+            c"GL_EXT_memory_object",
+            c"GL_EXT_memory_object_win32",
+            c"GL_EXT_semaphore",
+            c"GL_EXT_semaphore_win32",
+        ] {
+            if !(0..count)
+                .any(|i| CStr::from_ptr(glGetStringi(0x1F03, i as u32).cast()) == required)
+            {
+                return Err(format!("missing {}", required.to_string_lossy()));
+            }
+        }
+        windows::interop_loaded()?;
+        let mut luid = [0; 8];
+        glGetUnsignedBytevEXT(0x9599, luid.as_mut_ptr()); // GL_DEVICE_LUID_EXT
+        check_error("OpenGL device LUID")?;
+        Ok(luid)
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn check_error(operation: &str) -> Result<(), String> {
+    // SAFETY: the caller has a current context.
+    let error = unsafe { glGetError() };
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(format!("{operation}: GL error 0x{error:04x}"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn finish_shared() {
+    // SAFETY: the caller has a current context.
+    unsafe { glFinish() };
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn bind_2d(texture: GLuint) {
+    // SAFETY: the caller has a current context and a texture for this target.
+    unsafe { glBindTexture(TEXTURE_2D, texture) };
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn nearest_2d(texture: GLuint) {
+    // SAFETY: the caller has a current context and owns the texture.
+    unsafe {
+        glBindTexture(TEXTURE_2D, texture);
+        glTexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, NEAREST);
+        glTexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, NEAREST);
+        glTexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, CLAMP_TO_EDGE);
+        glTexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, CLAMP_TO_EDGE);
+    }
 }
 
 const VERTEX: &str = "#version 410 core
@@ -544,7 +679,7 @@ pub unsafe fn finish() {
 ///
 /// # Safety
 /// The context must be current.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub unsafe fn gen_texture() -> GLuint {
     let mut t = 0;
     // SAFETY: the caller has the context current.
@@ -554,7 +689,7 @@ pub unsafe fn gen_texture() -> GLuint {
 
 /// # Safety
 /// The context the texture was made in must be current.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub unsafe fn delete_texture(texture: GLuint) {
     // SAFETY: the caller has the context current.
     unsafe { glDeleteTextures(1, &texture) };

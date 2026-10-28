@@ -2949,6 +2949,7 @@ dependencies = [
 name = "vfx-ffgl"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-io-surface",

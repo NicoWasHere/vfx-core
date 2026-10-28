@@ -2,7 +2,7 @@
 
 use crate::gl;
 
-const FROM_CANVAS: &str = "#version 410 core
+pub(crate) const FROM_CANVAS: &str = "#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
 in vec2 uv;
