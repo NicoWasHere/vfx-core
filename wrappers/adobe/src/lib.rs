@@ -20,8 +20,8 @@ use pixel::{Depth, Placement};
 use vfx_core::Gpu;
 use vfx_wrapper_common::{diag, pipeline};
 
-/// Render-path notes, in `~/Library/Logs/VfxAdobe.log`.
-static LOG: diag::Log = diag::Log::new("VfxAdobe.log");
+/// Render-path notes, in `~/Library/Logs/<PLUGIN_FILE>-AfterEffects.log`.
+static LOG: diag::Log = diag::Log::new(concat!(env!("VFX_PLUGIN_FILE"), "-AfterEffects.log"));
 
 /// One device for the whole plugin, created on first render. `None` if no GPU adapter
 /// could be opened. Renders then pass the image through unchanged rather than fail.
@@ -73,7 +73,7 @@ pub mod reference {
 fn warn_once(message: &str) {
     LOG.note(&format!("warning: {message}"));
     if !WARNED.swap(true, Ordering::Relaxed) {
-        ae::log::error!("VFX Preview: {message}");
+        ae::log::error!("{}: {message}", env!("VFX_PLUGIN_NAME"));
     }
 }
 
@@ -569,9 +569,15 @@ pub unsafe extern "C" fn PluginDataEntryFunction3(
     unsafe {
         callback(
             in_ptr,
-            c"VFX Preview".as_ptr().cast(),
-            c"VFXPreview".as_ptr().cast(),
-            c"vfx-core".as_ptr().cast(),
+            vfx_wrapper_common::plugin_cstr!("VFX_PLUGIN_NAME")
+                .as_ptr()
+                .cast(),
+            vfx_wrapper_common::plugin_cstr!("VFX_AE_MATCH_NAME")
+                .as_ptr()
+                .cast(),
+            vfx_wrapper_common::plugin_cstr!("VFX_PLUGIN_CATEGORY")
+                .as_ptr()
+                .cast(),
             c"EffectMain".as_ptr().cast(),
             EFKT,
             13,

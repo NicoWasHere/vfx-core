@@ -62,11 +62,12 @@ jobs:
           ./wrappers/adobe/package-mac.sh
           ./wrappers/ofx/package-mac.sh
           ./wrappers/ffgl/bundle-mac.sh
-          name="VfxPreview-${VERSION#v}-macOS"
+          . ./plugin.env
+          name="$PLUGIN_FILE-${VERSION#v}-macOS"
           mkdir -p dist
-          cp target/vfx-plugin/VfxAdobe.pkg "dist/$name-AfterEffects.pkg"
-          cp target/vfx-plugin/VfxPreview-ofx.pkg "dist/$name-OpenFX.pkg"
-          ditto -c -k --keepParent target/vfx-plugin/VfxPreview.bundle "dist/$name-Resolume.zip"
+          cp "target/vfx-plugin/$PLUGIN_FILE-adobe.pkg" "dist/$name-AfterEffects.pkg"
+          cp "target/vfx-plugin/$PLUGIN_FILE-ofx.pkg" "dist/$name-OpenFX.pkg"
+          ditto -c -k --keepParent "target/vfx-plugin/$PLUGIN_FILE.bundle" "dist/$name-Resolume.zip"
 
       - uses: actions/upload-artifact@v4
         with:

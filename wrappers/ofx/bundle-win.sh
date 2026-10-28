@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the OpenFX plugin as a Windows (x64) bundle:
-#   target/vfx-plugin/VfxPreview.ofx.bundle
+#   target/vfx-plugin/<PLUGIN_FILE>.ofx.bundle   (names from plugin.env)
 # Usage: ./bundle-win.sh [debug|release] [--install]   (default: release)
 # --install copies it into C:\Program Files\Common Files\OFX\Plugins, where DaVinci
 # Resolve, Nuke, Natron and other OpenFX hosts on Windows look for plugins. Writing there
@@ -18,22 +18,24 @@ for arg in "$@"; do
 done
 here="$(cd "$(dirname "$0")" && pwd)"
 target="$here/../../target"
+# The plugin's names and IDs.
+. "$here/../../plugin.env"
 flag=""
 [ "$profile" = "release" ] && flag="--release"
 
 cargo build --manifest-path "$here/Cargo.toml" $flag
 
 # Same layout as on macOS, with the DLL renamed .ofx under Contents/Win64.
-bundle="$target/vfx-plugin/VfxPreview.ofx.bundle"
+bundle="$target/vfx-plugin/$PLUGIN_FILE.ofx.bundle"
 rm -rf "$bundle"
 mkdir -p "$bundle/Contents/Win64"
-cp "$target/$profile/vfx_ofx.dll" "$bundle/Contents/Win64/VfxPreview.ofx"
+cp "$target/$profile/vfx_ofx.dll" "$bundle/Contents/Win64/$PLUGIN_FILE.ofx"
 echo "$bundle"
 
 if [ "$install" = 1 ]; then
   dir="$(cygpath -u "${COMMONPROGRAMFILES:-C:\\Program Files\\Common Files}")/OFX/Plugins"
   mkdir -p "$dir"
-  rm -rf "$dir/VfxPreview.ofx.bundle"
+  rm -rf "$dir/$PLUGIN_FILE.ofx.bundle"
   cp -r "$bundle" "$dir/"
   echo "installed in $dir"
 fi

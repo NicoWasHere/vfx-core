@@ -1,4 +1,4 @@
-//! FFGL wrapper for vfx-core: the "VFX Preview" effect for Resolume Avenue and Arena,
+//! FFGL wrapper for vfx-core: the effect for Resolume Avenue and Arena,
 //! and other FFGL 2 hosts.
 //!
 //! The host calls `plugMain` on its GL thread with its context current. On macOS each
@@ -29,7 +29,7 @@ use vfx_wrapper_common::{diag, pipeline};
 use ffi::*;
 use params::PARAMS;
 
-static LOG: diag::Log = diag::Log::new("VfxFfgl.log");
+static LOG: diag::Log = diag::Log::new(concat!(env!("VFX_PLUGIN_FILE"), "-FFGL.log"));
 
 static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
 
@@ -46,11 +46,24 @@ fn gpu() -> Option<&'static Gpu> {
     .as_ref()
 }
 
+/// `text` in a fixed FFGL field, zero-padded. build.rs checks that it fits.
+const fn padded<const N: usize>(text: &str) -> [u8; N] {
+    let bytes = text.as_bytes();
+    assert!(bytes.len() <= N, "too long for its FFGL field");
+    let mut out = [0; N];
+    let mut i = 0;
+    while i < bytes.len() {
+        out[i] = bytes[i];
+        i += 1;
+    }
+    out
+}
+
 static INFO: PluginInfoStruct = PluginInfoStruct {
     api_major_version: 2,
     api_minor_version: 1,
-    plugin_unique_id: *b"VFXP",
-    plugin_name: *b"VFX Preview\0\0\0\0\0",
+    plugin_unique_id: padded(env!("VFX_FFGL_ID")),
+    plugin_name: padded(env!("VFX_PLUGIN_NAME")),
     plugin_type: FF_EFFECT,
 };
 
@@ -137,7 +150,9 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
         FF_GET_INFO => FFMixed::ptr(&INFO),
         FF_INITIALISE_V2 | FF_DEINITIALISE => FFMixed::success(),
         FF_GET_EXTENDED_INFO => FFMixed::ptr(&EXTENDED_INFO),
-        FF_GET_PLUGIN_SHORT_NAME => FFMixed::ptr(c"VFX Preview".as_ptr()),
+        FF_GET_PLUGIN_SHORT_NAME => {
+            FFMixed::ptr(vfx_wrapper_common::plugin_cstr!("VFX_PLUGIN_NAME").as_ptr())
+        }
         FF_GET_PLUGIN_CAPS => FFMixed::uint(match index {
             FF_CAP_SET_TIME => FF_TRUE,
             FF_CAP_MINIMUM_INPUT_FRAMES | FF_CAP_MAXIMUM_INPUT_FRAMES => 1,

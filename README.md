@@ -68,7 +68,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin wasm32-unknown-unknow
 | All wrapper tests | `cargo test -p vfx-wrapper-common -p vfx-adobe -p vfx-ofx -p vfx-ffgl` | unit tests |
 | Preview (desktop) | `cargo run -p vfx-preview --release` | window with control panel; drop a PNG/JPEG on it |
 | Preview (web) | `examples/preview/web/build.sh --serve` | http://localhost:8123 (needs `wasm-bindgen-cli` at the lockfile's version) |
-| After Effects | `wrappers/adobe/package-mac.sh` | `target/vfx-plugin/VfxAdobe.pkg` → installs to Adobe's MediaCore folder |
+| After Effects | `wrappers/adobe/package-mac.sh` | `target/vfx-plugin/VfxPreview-adobe.pkg` → installs to Adobe's MediaCore folder |
 | OpenFX | `wrappers/ofx/package-mac.sh` | `target/vfx-plugin/VfxPreview-ofx.pkg` → installs to `/Library/OFX/Plugins` |
 | OpenFX (Windows) | `wrappers/ofx/bundle-win.sh --install` | `VfxPreview.ofx.bundle` → `C:\Program Files\Common Files\OFX\Plugins` (run from Git Bash as administrator) |
 | Resolume | `wrappers/ffgl/bundle-mac.sh --install` | copies `VfxPreview.bundle` into `~/Documents/Resolume Avenue/Extra Effects` |
@@ -78,8 +78,31 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin wasm32-unknown-unknow
 The `.pkg` scripts sign and notarize only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
 `INSTALLER_IDENTITY` are set; without them the packages are unsigned (fine locally).
 Each plugin writes one-line notes about which render path ran to
-`~/Library/Logs/VfxAdobe.log`, `VfxOfx.log` or `VfxFfgl.log` (on Windows, the same names
-in `%TEMP%`).
+`~/Library/Logs/VfxPreview-AfterEffects.log`, `VfxPreview-OpenFX.log` or
+`VfxPreview-FFGL.log` (on Windows, the same names in `%TEMP%`).
+
+File names here use the default `PLUGIN_FILE`, `VfxPreview`; see the next section.
+
+## Your own plugin
+
+vfx-core is meant to be forked. A plugin's names and IDs live in one file,
+`plugin.env` at the repository root, and every wrapper, build script, installer and
+workflow reads them from there:
+
+| Key | Used for |
+|---|---|
+| `PLUGIN_NAME` | the name in each host's effect list (FFGL shows 16 bytes at most) |
+| `PLUGIN_CATEGORY` | the After Effects category and OpenFX grouping |
+| `PLUGIN_FILE` | bundle, DLL, installer and log file names |
+| `PLUGIN_ID` | the OpenFX identifier; macOS bundle and package IDs start with it |
+| `AE_MATCH_NAME` | the After Effects match name |
+| `FFGL_ID` | FFGL's four-character plugin code |
+| `WINDOWS_INSTALLER_ID` | the Windows installer's AppId, a GUID |
+
+Hosts find a plugin in saved projects by `PLUGIN_ID`, `AE_MATCH_NAME` and `FFGL_ID`,
+so pick them once and keep them; give a fork its own `WINDOWS_INSTALLER_ID` too.
+The effect itself is the chain in `wrappers/common/src/pipeline.rs` and the
+parameter panels in each wrapper's `params.rs`.
 
 ## Releases
 

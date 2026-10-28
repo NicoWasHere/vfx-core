@@ -1,4 +1,4 @@
-# VFX Preview for Resolume (FFGL)
+# The plugin for Resolume (FFGL)
 
 The vfx-core effect chain as an FFGL 2.1 effect for Resolume Avenue and Arena, and
 other FFGL 2 hosts.
@@ -9,9 +9,9 @@ On macOS:
 wrappers/ffgl/bundle-mac.sh --install
 ```
 
-This builds a universal `VfxPreview.bundle` and copies it into
+This builds a universal `VfxPreview.bundle` (named from `plugin.env`) and copies it into
 `~/Documents/Resolume Avenue/Extra Effects` (and Arena's, if present). Restart Resolume,
-then find **VFX Preview** in the Effects browser.
+then find the plugin (**VFX Preview** by default) in the Effects browser.
 
 On Windows, from Git Bash with Rust installed:
 
@@ -45,8 +45,8 @@ OpenGL context alone. On Windows, GL draws convert the row order and alpha befor
 readback and after upload; the RAM buffers already match the pipeline's canvas.
 The pipeline reuses its readback buffer and copies straight into float storage.
 
-`~/Library/Logs/VfxFfgl.log` records which path ran on macOS. On Windows the log is
-`%TEMP%\VfxFfgl.log`. `VFX_FFGL_PATH=ram` forces the RAM path.
+`~/Library/Logs/VfxPreview-FFGL.log` records which path ran on macOS. On Windows the
+log is `%TEMP%\VfxPreview-FFGL.log`. `VFX_FFGL_PATH=ram` forces the RAM path.
 
 Measured on an Apple M5 with blur radius 8 and the vignette on:
 
