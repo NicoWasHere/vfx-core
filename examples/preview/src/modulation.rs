@@ -96,6 +96,8 @@ pub mod target {
     pub const FLIP_Y: usize = 12;
     pub const SEGCAM_SENSITIVITY: usize = 13;
     pub const SEGCAM_MIN_SIZE: usize = 14;
+    pub const SEGCAM_LIVE_SENSITIVITY: usize = 15;
+    pub const SEGCAM_LIVE_LIFETIME: usize = 16;
 }
 
 pub const TARGETS: &[Target] = &[
@@ -143,6 +145,12 @@ pub const TARGETS: &[Target] = &[
     },
     Target {
         field: |c| &mut c.segcam_min_size,
+    },
+    Target {
+        field: |c| &mut c.segcam_live_sensitivity,
+    },
+    Target {
+        field: |c| &mut c.segcam_live_lifetime,
     },
 ];
 

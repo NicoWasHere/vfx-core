@@ -53,6 +53,16 @@ pub struct Controls {
     pub segcam_labels: bool,
     pub segcam_trail: usize,
     pub segcam_max_tiles: usize,
+    /// segcam-live: the swarm with a pile kept between frames. Takes over from segcam
+    /// motion while on.
+    pub segcam_live_on: bool,
+    pub segcam_live_sensitivity: f32,
+    pub segcam_live_min_size: f32,
+    pub segcam_live_background: usize,
+    pub segcam_live_max_segments: usize,
+    /// Frames a window stays up.
+    pub segcam_live_lifetime: f32,
+    pub segcam_live_max_tiles: usize,
 }
 
 impl Default for Controls {
@@ -93,6 +103,13 @@ impl Default for Controls {
             segcam_labels: true,
             segcam_trail: 24,
             segcam_max_tiles: 100,
+            segcam_live_on: false,
+            segcam_live_sensitivity: 0.864,
+            segcam_live_min_size: 0.25,
+            segcam_live_background: 16,
+            segcam_live_max_segments: 16,
+            segcam_live_lifetime: 60.0,
+            segcam_live_max_tiles: 100,
         }
     }
 }
@@ -353,6 +370,37 @@ pub fn panel(
                 ui.checkbox(&mut c.segcam_labels, "Labels");
             }
             ui.label(RichText::new("Video and webcam only; starts over on a seek.").weak());
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        section(ui, "Segcam live", Some(&mut c.segcam_live_on), |ui| {
+            param(
+                ui,
+                &mut c.segcam_live_sensitivity,
+                0.0..=1.0,
+                "Sensitivity",
+                target::SEGCAM_LIVE_SENSITIVITY,
+            );
+            ui.add(egui::Slider::new(&mut c.segcam_live_min_size, 0.0..=10.0).text("Min size %"));
+            param(
+                ui,
+                &mut c.segcam_live_lifetime,
+                1.0..=300.0,
+                "Lifetime (frames)",
+                target::SEGCAM_LIVE_LIFETIME,
+            );
+            ui.add(egui::Slider::new(&mut c.segcam_live_max_tiles, 1..=400).text("Max tiles"));
+            ui.add(
+                egui::Slider::new(&mut c.segcam_live_background, 1..=60).text("Background frames"),
+            );
+            ui.add(egui::Slider::new(&mut c.segcam_live_max_segments, 1..=64).text("Max segments"));
+            ui.label(
+                RichText::new(
+                    "The swarm, kept between frames: windows stay up for their lifetime \
+                     or until max tiles pushes them out. Replaces Segcam motion while on.",
+                )
+                .weak(),
+            );
         });
 
         section(ui, "Flip", None, |ui| {

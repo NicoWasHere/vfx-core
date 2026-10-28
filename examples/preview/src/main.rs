@@ -19,6 +19,8 @@ mod modulation;
 #[cfg(not(target_arch = "wasm32"))]
 mod segcam;
 #[cfg(not(target_arch = "wasm32"))]
+mod segcam_live;
+#[cfg(not(target_arch = "wasm32"))]
 mod video;
 
 use std::sync::Arc;
