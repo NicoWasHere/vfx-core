@@ -5,6 +5,8 @@
  * and parameters, then renders generated textures through FF_PROCESS_OPENGL into a
  * framebuffer and checks the pixels and the GL state the plugin leaves behind.
  *
+ * FFGL_MINIHOST_SOFTWARE=1 uses Apple's software renderer, as on CI runners.
+ *
  *   minihost <plugin binary> [case]   cases: all (default), info, passthrough,
  *                                     brightness, padding, blur, vignette, state, timing
  * Exit status 0 when every check passes.
@@ -319,14 +321,27 @@ static Case cases[] = {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: minihost <plugin binary> [case]\n"); return 2; }
-    CGLPixelFormatAttribute attrs[] = {
+    /* Prefer the GPU. Virtual machines (CI runners) have no accelerated OpenGL, so fall
+       back to Apple's software renderer; the plugin then takes its RAM path. */
+    CGLPixelFormatAttribute accelerated[] = {
         kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
         kCGLPFAAccelerated, kCGLPFAAllowOfflineRenderers, (CGLPixelFormatAttribute)0,
     };
-    CGLPixelFormatObj pf; GLint npf; CGLContextObj ctx;
-    if (CGLChoosePixelFormat(attrs, &pf, &npf) || !pf || CGLCreateContext(pf, NULL, &ctx)) {
-        fprintf(stderr, "no OpenGL 4.1 core context\n"); return 2;
+    CGLPixelFormatAttribute software[] = {
+        kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
+        kCGLPFARendererID, (CGLPixelFormatAttribute)kCGLRendererGenericFloatID, (CGLPixelFormatAttribute)0,
+    };
+    CGLPixelFormatObj pf = NULL; GLint npf; CGLContextObj ctx;
+    /* FFGL_MINIHOST_SOFTWARE=1 forces the software renderer, to test that path here. */
+    int force_software = getenv("FFGL_MINIHOST_SOFTWARE") != NULL;
+    if (force_software || CGLChoosePixelFormat(accelerated, &pf, &npf) || !pf) {
+        pf = NULL;
+        if (CGLChoosePixelFormat(software, &pf, &npf) || !pf) {
+            fprintf(stderr, "no OpenGL 4.1 core context\n"); return 2;
+        }
+        printf("no accelerated OpenGL; using the software renderer\n");
     }
+    if (CGLCreateContext(pf, NULL, &ctx)) { fprintf(stderr, "CGLCreateContext failed\n"); return 2; }
     CGLSetCurrentContext(ctx);
     printf("GL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 

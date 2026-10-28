@@ -108,7 +108,7 @@ fn blur_spreads_an_impulse_and_keeps_its_energy() {
         "symmetric across axes"
     );
 
-    let total: u32 = out.chunks_exact(4).map(|p| u32::from(p[0])).sum();
+    let total: u32 = out.as_chunks::<4>().0.iter().map(|p| u32::from(p[0])).sum();
     assert!(
         (245..=265).contains(&total),
         "energy preserved, sum {total}"
