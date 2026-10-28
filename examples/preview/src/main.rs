@@ -1,72 +1,55 @@
-//! Live preview: a CPU-generated test pattern runs through ColorAdjust → GaussianBlur
-//! → FeedbackTrail on the GPU and is shown in a window.
+//! Standalone preview of the vfx-core effect chain, with a control panel.
 //!
-//! Keys: 1/2/3 select a stage. Up/Down change its main parameter.
-//! Escape or closing the window quits.
+//! The image is a generated test pattern (or a PNG / JPEG dropped on the window). It
+//! runs through the same pipeline the After Effects, OpenFX and FFGL plugins use, plus
+//! a feedback trail, all on the GPU. The panel on the right drives every parameter;
+//! clicking the image moves the vignette centre. Escape quits.
 //!
-//! The window is a separate crate so vfx-core never depends on windowing.
+//! This is a separate crate so vfx-core never depends on windowing or UI code.
+
+mod controls;
+mod effects;
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use vfx_core::effects::{ColorAdjust, FeedbackTrail, GaussianBlur};
-use vfx_core::{EffectChain, Frame, Gpu, ParamValue};
+use controls::{Controls, Status};
+use effects::Effects;
+use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
-
-const FRAME_W: u32 = 640;
-const FRAME_H: u32 = 360;
-const FRAME_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-
-/// Each stage's main parameter, with the step used for one key press.
-const STAGES: [(&str, &str, f32); 3] = [
-    ("color adjust", "brightness", 0.05),
-    ("blur", "radius", 0.5),
-    ("feedback", "decay", 0.05),
-];
-
-const BLIT_WGSL: &str = r#"
-@group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> dst_size: vec4<f32>; // xy: window size in pixels
-
-@vertex
-fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
-    let x = f32(i & 1u) * 4.0 - 1.0;
-    let y = f32(i & 2u) * 2.0 - 1.0;
-    return vec4<f32>(x, y, 0.0, 1.0);
-}
-
-@fragment
-fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    // Nearest-neighbour scale from the effect frame to the window.
-    let src_size = vec2<f32>(textureDimensions(src));
-    let p = vec2<i32>(pos.xy * src_size / dst_size.xy);
-    return textureLoad(src, p, 0);
-}
-"#;
+use winit::window::{Window, WindowId};
 
 struct Preview {
-    window: Arc<dyn Window>,
+    window: Arc<Window>,
     gpu: Gpu,
     surface: wgpu::Surface<'static>,
-    surface_format: wgpu::TextureFormat,
-    blit_layout: wgpu::BindGroupLayout,
-    blit_pipeline: wgpu::RenderPipeline,
-    blit_size: wgpu::Buffer,
-    chain: EffectChain,
-    input: Frame,
-    output: Frame,
-    selected: usize,
-    frame: u32,
+    config: wgpu::SurfaceConfiguration,
+    egui: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    effects: Effects,
+    /// The effects output, registered with egui; re-registered when its size changes.
+    image: egui::TextureId,
+    image_size: (u32, u32),
+    controls: Controls,
+    time: f64,
+    last_frame: Instant,
+    fps: f32,
+    message: Option<String>,
 }
 
 impl Preview {
-    fn new(event_loop: &dyn ActiveEventLoop) -> Self {
-        let window: Arc<dyn Window> = Arc::from(
+    fn new(event_loop: &ActiveEventLoop) -> Self {
+        let window = Arc::new(
             event_loop
-                .create_window(WindowAttributes::default().with_title("vfx preview"))
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("VFX Preview")
+                        .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 820.0)),
+                )
                 .expect("create window"),
         );
 
@@ -88,157 +71,169 @@ impl Preview {
                 .expect("request device");
         let gpu = Gpu::from_parts(device, queue);
 
-        let size = window.surface_size();
+        let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        let surface_format = caps
+        let format = caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
-        surface.configure(
-            &gpu.device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: surface_format,
-                width: size.width.max(1),
-                height: size.height.max(1),
-                present_mode: wgpu::PresentMode::AutoVsync,
-                desired_maximum_frame_latency: 2,
-                alpha_mode: caps.alpha_modes[0],
-                view_formats: vec![],
-                color_space: Default::default(),
-            },
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            color_space: Default::default(),
+        };
+        surface.configure(&gpu.device, &config);
+
+        let egui = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
+        let mut egui_renderer =
+            egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
 
-        let mut chain = EffectChain::new();
-        chain.push(Box::new(ColorAdjust::default()));
-        chain.push(Box::new(GaussianBlur::default()));
-        chain.push(Box::new(FeedbackTrail::default()));
-        chain.prepare(&gpu, FRAME_FORMAT, (FRAME_W, FRAME_H));
+        let effects = Effects::new(&gpu);
+        let image = egui_renderer.register_native_texture(
+            &gpu.device,
+            effects.display_view(),
+            wgpu::FilterMode::Linear,
+        );
+        let image_size = effects.size();
 
-        let (blit_layout, blit_pipeline) = blit_pipeline(&gpu.device, surface_format);
-        let blit_size = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("blit size"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let input = Frame::new(&gpu, FRAME_W, FRAME_H, FRAME_FORMAT);
-        let output = Frame::new(&gpu, FRAME_W, FRAME_H, FRAME_FORMAT);
-
-        let preview = Self {
+        Self {
             window,
             gpu,
             surface,
-            surface_format,
-            blit_layout,
-            blit_pipeline,
-            blit_size,
-            chain,
-            input,
-            output,
-            selected: 0,
-            frame: 0,
-        };
-        preview.update_title();
-        preview
+            config,
+            egui,
+            egui_state,
+            egui_renderer,
+            effects,
+            image,
+            image_size,
+            controls: Controls::default(),
+            time: 0.0,
+            last_frame: Instant::now(),
+            fps: 0.0,
+            message: None,
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
-        self.surface.configure(
-            &self.gpu.device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: self.surface_format,
-                width: width.max(1),
-                height: height.max(1),
-                present_mode: wgpu::PresentMode::AutoVsync,
-                desired_maximum_frame_latency: 2,
-                alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                view_formats: vec![],
-                color_space: Default::default(),
-            },
-        );
+        self.config.width = width.max(1);
+        self.config.height = height.max(1);
+        self.surface.configure(&self.gpu.device, &self.config);
     }
 
-    /// Changes the selected stage's main parameter by one step.
-    fn nudge(&mut self, direction: f32) {
-        let (_, name, step) = STAGES[self.selected];
-        let params = self.chain.params_mut(self.selected);
-        let current = match params.get(name) {
-            Some(ParamValue::Float(v)) => v,
-            other => panic!("expected float parameter `{name}`, found {other:?}"),
-        };
-        params
-            .set(name, ParamValue::Float(current + direction * step))
-            .expect("parameter exists and is a float");
-        self.update_title();
+    /// Points egui at the effects output again after its size (and texture) changed.
+    fn refresh_image(&mut self) {
+        if self.effects.size() != self.image_size {
+            self.egui_renderer.free_texture(&self.image);
+            self.image = self.egui_renderer.register_native_texture(
+                &self.gpu.device,
+                self.effects.display_view(),
+                wgpu::FilterMode::Linear,
+            );
+            self.image_size = self.effects.size();
+        }
     }
 
-    fn update_title(&self) {
-        let (label, name, _) = STAGES[self.selected];
-        let value = match self.chain.params(self.selected).get(name) {
-            Some(ParamValue::Float(v)) => v,
-            other => panic!("expected float parameter `{name}`, found {other:?}"),
-        };
-        self.window.set_title(&format!(
-            "vfx preview · {label}: {name} = {value:.2}  (1-3 select, ↑↓ adjust)"
-        ));
+    fn open(&mut self, path: &std::path::Path) {
+        self.message = self
+            .effects
+            .load_image(&self.gpu, path)
+            .err()
+            .map(|e| format!("Couldn't open {}: {e}", path.display()));
+        self.refresh_image();
     }
 
     fn draw(&mut self) {
-        let t = self.frame as f32 / 60.0;
-        self.frame = self.frame.wrapping_add(1);
-        let pixels = test_pattern(t);
-        self.input.write(&self.gpu, &pixels);
-        self.chain
-            .render(&self.gpu, &self.input, &self.output, f64::from(t));
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f64();
+        self.last_frame = now;
+        if dt > 0.0 {
+            self.fps = self.fps * 0.9 + (1.0 / dt as f32) * 0.1;
+        }
+        if self.controls.animate {
+            self.time += dt;
+        }
 
-        let texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+        self.effects.render(&self.gpu, &self.controls, self.time);
+
+        let input = self.egui_state.take_egui_input(&self.window);
+        let (image, image_size) = (self.image, self.image_size);
+        let status = Status {
+            fps: self.fps,
+            size: image_size,
+            image: self.effects.image_name(),
+            message: self.message.as_deref(),
+        };
+        let controls = &mut self.controls;
+        let mut actions = controls::Actions::default();
+        let output = self.egui.run_ui(input, |ui| {
+            egui::Panel::right("controls")
+                .resizable(false)
+                .exact_size(320.0)
+                .show(ui, |ui| actions = controls::panel(ui, controls, &status));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(18)))
+                .show(ui, |ui| show_image(ui, image, image_size, controls));
+        });
+        if actions.clear_image {
+            self.effects.clear_image(&self.gpu);
+            self.message = None;
+            self.refresh_image();
+        }
+        self.egui_state
+            .handle_platform_output(&self.window, output.platform_output);
+        // Apply texture updates before anything can skip the frame: egui sends each
+        // update once (the font atlas only on the first frame), so a skipped update is
+        // lost and text and fills disappear.
+        for (id, deltas) in &output.textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.gpu.device, &self.gpu.queue, *id, delta);
+            }
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => {
-                let size = self.window.surface_size();
+                let size = self.window.inner_size();
                 self.resize(size.width, size.height);
                 return;
             }
         };
-        let view = texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let size = texture.texture.size();
-        self.gpu.queue.write_buffer(
-            &self.blit_size,
-            0,
-            bytemuck::bytes_of(&[size.width as f32, size.height as f32, 0.0, 0.0]),
+        let view = frame.texture.create_view(&Default::default());
+        let jobs = self.egui.tessellate(output.shapes, output.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: output.pixels_per_point,
+        };
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        let mut commands = self.egui_renderer.update_buffers(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &mut encoder,
+            &jobs,
+            &screen,
         );
-        let bind = self
-            .gpu
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit"),
-                layout: &self.blit_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.output.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.blit_size.as_entire_binding(),
-                    },
-                ],
-            });
-
-        let mut encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blit to window"),
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -253,99 +248,47 @@ impl Preview {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.blit_pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
+            self.egui_renderer
+                .render(&mut pass.forget_lifetime(), &jobs, &screen);
         }
-        self.gpu.queue.submit(Some(encoder.finish()));
+        commands.push(encoder.finish());
+        self.gpu.queue.submit(commands);
         self.window.pre_present_notify();
-        self.gpu.queue.present(texture);
-    }
-}
-
-/// Moving gradient with a bright disc, built on the CPU each frame.
-fn test_pattern(t: f32) -> Vec<u8> {
-    let mut pixels = vec![0u8; (FRAME_W * FRAME_H * 4) as usize];
-    let cx = FRAME_W as f32 * (0.5 + 0.35 * (t * 0.8).cos());
-    let cy = FRAME_H as f32 * (0.5 + 0.35 * (t * 0.6).sin());
-    for y in 0..FRAME_H {
-        for x in 0..FRAME_W {
-            let i = ((y * FRAME_W + x) * 4) as usize;
-            let (fx, fy) = (x as f32, y as f32);
-            let inside = (fx - cx).hypot(fy - cy) < 40.0;
-            pixels[i] = (fx / FRAME_W as f32 * 255.0) as u8;
-            pixels[i + 1] = (fy / FRAME_H as f32 * 255.0) as u8;
-            pixels[i + 2] = if inside { 255 } else { 40 };
-            pixels[i + 3] = 255;
+        self.gpu.queue.present(frame);
+        for id in &output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
         }
     }
-    pixels
 }
 
-fn blit_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("blit layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("blit"),
-        source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("blit"),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 0,
-    });
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("blit"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &module,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: &module,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    (layout, pipeline)
+/// The effects output, fitted into the central area. Clicking or dragging on it moves
+/// the vignette centre.
+fn show_image(
+    ui: &mut egui::Ui,
+    image: egui::TextureId,
+    size: (u32, u32),
+    controls: &mut Controls,
+) {
+    let area = ui.available_rect_before_wrap().shrink(12.0);
+    let aspect = size.0 as f32 / size.1 as f32;
+    let (w, h) = if area.width() / area.height() > aspect {
+        (area.height() * aspect, area.height())
+    } else {
+        (area.width(), area.width() / aspect)
+    };
+    let rect = egui::Rect::from_center_size(area.center(), egui::vec2(w, h));
+    let response = ui.put(
+        rect,
+        egui::Image::new(egui::load::SizedTexture::new(image, egui::vec2(w, h)))
+            .sense(egui::Sense::click_and_drag()),
+    );
+    if (response.clicked() || response.dragged())
+        && let Some(p) = response.interact_pointer_pos()
+    {
+        let n = (p - rect.min) / rect.size();
+        controls.vignette_center = [n.x.clamp(0.0, 1.0), n.y.clamp(0.0, 1.0)];
+        controls.vignette_on = true;
+    }
 }
 
 #[derive(Default)]
@@ -354,46 +297,45 @@ struct App {
 }
 
 impl ApplicationHandler for App {
-    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.preview.is_none() {
             self.preview = Some(Preview::new(event_loop));
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &dyn ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(preview) = self.preview.as_mut() else {
             return;
         };
+        let consumed = preview
+            .egui_state
+            .on_window_event(&preview.window, &event)
+            .consumed;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::SurfaceResized(size) => preview.resize(size.width, size.height),
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                match event.logical_key.as_ref() {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Character("1") => preview.selected = 0,
-                    Key::Character("2") => preview.selected = 1,
-                    Key::Character("3") => preview.selected = 2,
-                    Key::Named(NamedKey::ArrowUp) => preview.nudge(1.0),
-                    Key::Named(NamedKey::ArrowDown) => preview.nudge(-1.0),
-                    _ => {}
+            WindowEvent::Resized(size) => preview.resize(size.width, size.height),
+            WindowEvent::DroppedFile(path) => preview.open(&path),
+            WindowEvent::KeyboardInput { event, .. }
+                if !consumed && event.state == ElementState::Pressed =>
+            {
+                if event.logical_key == Key::Named(NamedKey::Escape) {
+                    event_loop.exit();
                 }
             }
-            WindowEvent::RedrawRequested => {
-                preview.draw();
-                preview.window.request_redraw();
-            }
+            WindowEvent::RedrawRequested => preview.draw(),
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(preview) = &self.preview {
+            preview.window.request_redraw();
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
-    event_loop.run_app(App::default())?;
+    event_loop.run_app(&mut App::default())?;
     Ok(())
 }

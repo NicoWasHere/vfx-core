@@ -7,7 +7,13 @@ publish = false
 
 [dependencies]
 vfx-core = { path = "../.." }
+vfx-wrapper-common = { path = "../../wrappers/common" }
 wgpu = "=30.0.1"
-winit = "0.31.0-beta.4"
+# egui's winit backend targets winit 0.30.
+winit = "0.30.13"
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37.0", default-features = false }
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 pollster = "1.0.1"
 bytemuck = "1.25.2"
