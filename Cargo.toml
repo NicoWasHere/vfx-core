@@ -13,6 +13,6 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 pollster = "1.0.1"
 
 [workspace]
-members = [".", "examples/preview", "examples/segcam-motion", "examples/segcam-motion-ofx", "wrappers/common", "wrappers/adobe", "wrappers/ofx", "wrappers/ffgl"]
+members = [".", "examples/preview", "examples/segcam-motion", "examples/segcam-motion-ofx", "examples/segcam-motion-ffgl", "wrappers/common", "wrappers/adobe", "wrappers/ofx", "wrappers/ffgl", "wrappers/ffgl-common"]
 # Plain `cargo test` builds only the core, so windowing never enters CI on Linux.
 default-members = ["."]

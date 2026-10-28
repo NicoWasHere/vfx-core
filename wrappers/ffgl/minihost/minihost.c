@@ -389,8 +389,9 @@ static void case_info(void) {
         }
     }
     char group[64] = {0};
-    GetString g = {(uint32_t)param("Brightness"), group, sizeof group - 1};
-    CHECK(call(GET_PARAM_GROUP, ptr(&g), NULL).u == 0 && !strcmp(group, "Color"), "Brightness group is '%s'", group);
+    int segcam = info && !memcmp(info->id, "SGCM", 4);
+    GetString g = {(uint32_t)param(segcam ? "Sensitivity" : "Brightness"), group, sizeof group - 1};
+    CHECK(call(GET_PARAM_GROUP, ptr(&g), NULL).u == 0 && !strcmp(group, segcam ? "Motion" : "Color"), "parameter group is '%s'", group);
 }
 
 static void case_passthrough(void) {
@@ -475,10 +476,42 @@ static void case_vignette(void) {
     call(DEINSTANTIATE_GL, u(0), inst);
 }
 
+static void free_frame(Frame *f) {
+#ifdef _WIN32
+    typedef void (APIENTRY *DeleteFramebuffers)(GLsizei, const GLuint *);
+    typedef void (APIENTRY *DeleteTextures)(GLsizei, const GLuint *);
+    ((DeleteFramebuffers)gl_proc("glDeleteFramebuffers"))(1, &f->target.fbo);
+    DeleteTextures delete_textures = (DeleteTextures)gl_proc("glDeleteTextures");
+    delete_textures(1, &f->target.color);
+    delete_textures(1, &f->input);
+#else
+    glDeleteFramebuffers(1, &f->target.fbo);
+    glDeleteTextures(1, &f->target.color);
+    glDeleteTextures(1, &f->input);
+#endif
+    free(f->straight);
+    free(f->out);
+}
+
+static void case_segcam(void) {
+    case_info();
+    void *inst = instantiate(63, 37);
+    Frame f = frame(63, 37, 128, 64);
+    CHECK(render(inst, &f), "segcam first frame failed");
+    CHECK(max_diff(&f) <= 1.0f / 255, "segcam first overlay should preserve the input");
+    set(inst, "Output", 1);
+    CHECK(render(inst, &f), "segcam matte failed");
+    for (int i = 0; i < f.w * f.h; i++)
+        if (f.out[i * 4 + 3] != 0) { CHECK(0, "still image produced motion"); break; }
+    call(DEINSTANTIATE_GL, u(0), inst);
+    free_frame(&f);
+}
+
 static void case_state(void) {
     /* FFGL hosts expect the plugin to leave GL state as it found it. */
     void *inst = instantiate(64, 48);
-    set(inst, "Blur Radius", 2);
+    PluginInfo *info = call(GET_INFO, u(0), NULL).p;
+    set(inst, !memcmp(info->id, "SGCM", 4) ? "Output" : "Blur Radius", 2);
     Frame f = frame(64, 48, 64, 48);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, f.target.fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -502,6 +535,7 @@ static void case_state(void) {
     GLint pack; glGetIntegerv(GL_PACK_ALIGNMENT, &pack); CHECK(pack == 4, "pack alignment %d", pack);
     CHECK(glGetError() == GL_NO_ERROR, "GL error after process");
     call(DEINSTANTIATE_GL, u(0), inst);
+    free_frame(&f);
 }
 
 static double now(void) {
@@ -516,6 +550,8 @@ static double now(void) {
     return t.tv_sec + t.tv_nsec * 1e-9;
 #endif
 }
+
+#include "segcam.h"
 
 static void case_timing(void) {
     int sizes[][2] = {{1280, 720}, {1920, 1080}};
@@ -558,17 +594,6 @@ static int logged_message(const char *message) {
     while (fgets(line, sizeof line, log)) if (!strncmp(line, prefix, strlen(prefix)) && strstr(line, message)) found = 1;
     fclose(log);
     return found;
-}
-
-static void free_frame(Frame *f) {
-    typedef void (APIENTRY *DeleteFramebuffers)(GLsizei, const GLuint *);
-    typedef void (APIENTRY *DeleteTextures)(GLsizei, const GLuint *);
-    ((DeleteFramebuffers)gl_proc("glDeleteFramebuffers"))(1, &f->target.fbo);
-    DeleteTextures delete_textures = (DeleteTextures)gl_proc("glDeleteTextures");
-    delete_textures(1, &f->target.color);
-    delete_textures(1, &f->input);
-    free(f->straight);
-    free(f->out);
 }
 
 static void case_sharing(void) {
@@ -683,7 +708,21 @@ int main(int argc, char **argv) {
     if (!plug) { fprintf(stderr, "no plugMain export\n"); return 2; }
     if (call(INITIALISE_V2, u(0), NULL).u != 0) { fprintf(stderr, "initialise failed\n"); return 2; }
 
+    PluginInfo *info = call(GET_INFO, u(0), NULL).p;
+    int segcam = info && !memcmp(info->id, "SGCM", 4);
     const char *only = argc > 2 ? argv[2] : "all";
+    if (segcam && !strcmp(only, "segcam-stream")) {
+        int result = segcam_stream(argc, argv);
+        call(DEINITIALISE, u(0), NULL);
+        return result;
+    }
+    if (segcam && (!strcmp(only, "segcam") || !strcmp(only, "all") || !strcmp(only, "segcam-timing"))) {
+        if (strcmp(only, "segcam-timing")) { case_segcam(); case_state(); }
+        if (strcmp(only, "segcam")) segcam_timing();
+        printf("segcam: %d failure(s)\n", failures);
+        call(DEINITIALISE, u(0), NULL);
+        return failures ? 1 : 0;
+    }
     int ran = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         if (strcmp(only, "all") && strcmp(only, cases[i].name)) continue;

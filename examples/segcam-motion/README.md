@@ -38,7 +38,7 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 ## How it renders
 
 After Effects can ask for any frame in any order, on any thread, so the effect keeps no
-state between renders. Pre-render checks out the **Background** before the current
+state between renders. Pre-render checks out the **Background** frames before the current
 one (plus **Trail frames** - 1 in Swarm mode), and render hands them to the core one
 at a time through `FrameSource::with_frame`. Each frame is held only while the core boils
 it down to a luma grid (and, for the swarm, cuts its tiles), then checked back in. So
@@ -152,3 +152,72 @@ is unchanged. High-depth outputs are compared after rounding to 8-bit levels; th
 is not a native 16-bit or HDR precision check.
 Natron 2.5 on Windows has rendered the overlay with temporal input. Resolve, Nuke
 and macOS host validation are still pending.
+
+## Resolume (FFGL)
+
+The same CPU core also builds as an FFGL 2.1 plugin for Avenue and Arena. On Windows,
+run from Git Bash with Rust and a C compiler available:
+
+```bash
+examples/segcam-motion-ffgl/bundle-win.sh --install
+```
+
+On macOS, with the `aarch64-apple-darwin` and `x86_64-apple-darwin` Rust targets:
+
+```bash
+examples/segcam-motion-ffgl/bundle-mac.sh --install
+```
+
+Without `--install`, the scripts only build into `target/vfx-plugin`. Copy
+`SegcamMotionRust.dll` or `SegcamMotionRust.bundle` into
+`~/Documents/Resolume Avenue/Extra Effects` (or Arena's), then restart the host.
+The effect is **segcam Motion**, ID `SGCM`; it is separate from VFX Preview. The
+After Effects glue is not built for this target. CI builds the Windows DLL and
+universal macOS bundle and uploads them with the other plugins.
+
+The controls match After Effects: Output, Sensitivity, Adaptation, Background,
+Minimum size, Max segments, Grid width, Mirror, Boxes, Labels, Box color, Trail
+frames and Swarm max tiles. FFGL expresses Box color as consecutive Box red,
+Box green and Box blue parameters. All names stay under 16 characters.
+
+Resolume supplies only the current frame, so the plugin keeps a ring of recent
+straight ARGB byte frames. It reuses those buffers, reads padded host textures
+through GL, and reverses the alpha and row conversions when drawing the result.
+The ring resets on a size change or backwards host time. More Background or Trail
+frames take time to fill; scrubbing cannot ask the host for missing history.
+Default history takes about 134 MiB at 1080p for Overlay and the mattes, or 316 MiB
+for Swarm, plus the output, GL textures and the core's temporary work.
+
+Release mini-host measurements on Windows with an AMD RX 5700 XT, driver
+26.10.1.261008, at the default settings, with a shape alternating between two positions:
+
+| Mode | 720p | 1080p |
+|---|---:|---:|
+| Overlay | 8.69 ms | 12.58 ms |
+| Motion matte | 28.21 ms | 54.46 ms |
+| Box matte | 10.90 ms | 16.65 ms |
+| Swarm | 68.68 ms | 125.75 ms |
+
+These are means over 30 frames after 40 warm-ups, including the plugin's GL
+readback, CPU render, upload and a GL finish. Host uploads and output readback are
+excluded. Overlay clears the 30 fps target at 1080p here; Motion matte and Swarm
+need lower resolutions or cheaper settings for live work. Results depend on the
+CPU, scene, grid and history; they are not Resolume's total composition frame times.
+
+On this machine the mini host matched the CLI byte for byte on 960 frames across
+all four modes, including partial and zero alpha, padding, custom settings,
+backwards time and resize. The CLI's `--straight-alpha` switch supplies the same
+alpha convention as the CPU adapter; comparison premultiplies the result for FFGL.
+The VFX Preview mini host still passes with GPU sharing required and with RAM forced.
+
+```bash
+cargo test -p segcam-motion --no-default-features
+cargo test -p segcam-motion-ffgl -p vfx-ffgl-common
+examples/segcam-motion-ffgl/minihost/run.sh
+```
+
+Avenue 7.28.1 on Windows also loaded the DLL, rendered a generated moving clip in
+every mode and accepted live changes to every control. Its plugin log is
+`%TEMP%/SegcamMotionRust-FFGL.log` (on macOS, `~/Library/Logs/SegcamMotionRust-FFGL.log`).
+macOS host testing, Arena, prolonged use and saved-project compatibility are unrun.
+See [the FFGL adapter](../segcam-motion-ffgl/README.md) for the harness details.

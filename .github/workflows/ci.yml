@@ -38,8 +38,8 @@ jobs:
       # The segcam Motion example: its core is plain Rust, so it tests on every OS.
       - name: segcam Motion example (clippy, core checks)
         run: |
-          cargo clippy -p segcam-motion --all-targets -- -D warnings
-          cargo test -p segcam-motion
+          cargo clippy -p segcam-motion --no-default-features --all-targets -- -D warnings
+          cargo test -p segcam-motion --no-default-features
 
   # The After Effects / Premiere plugin: a universal .plugin bundle on macOS and an
   # .aex on Windows. Unsigned; signing needs the publisher's certificates.
@@ -55,9 +55,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          components: clippy
 
       - name: Wrapper tests (pixel conversion, pipeline, Metal interop on macOS)
         run: cargo test -p vfx-adobe --lib
+
+      - name: segcam FFGL tests and clippy
+        run: |
+          cargo test -p segcam-motion-ffgl -p vfx-ffgl-common
+          cargo clippy -p segcam-motion-ffgl -p vfx-ffgl-common -p vfx-ffgl --all-targets -- -D warnings
+
+      - name: segcam FFGL mini host and CLI comparison (macOS)
+        if: runner.os == 'macOS'
+        env:
+          FFGL_MINIHOST_SOFTWARE: 1
+        run: ./examples/segcam-motion-ffgl/minihost/run.sh
 
       # OpenFX and FFGL: unit tests, then each plugin in its minimal host. The OpenFX
       # host needs the OpenFX headers (from the official repository); the FFGL host
@@ -75,6 +87,8 @@ jobs:
         run: |
           ./wrappers/adobe/package-mac.sh
           ./examples/segcam-motion/package-mac.sh
+          ./wrappers/ffgl/bundle-mac.sh
+          ./examples/segcam-motion-ffgl/bundle-mac.sh
 
       - name: Build Windows .aex
         if: runner.os == 'Windows'
@@ -121,7 +135,9 @@ jobs:
       - name: Build Windows FFGL DLL
         if: runner.os == 'Windows'
         shell: bash
-        run: ./wrappers/ffgl/bundle-win.sh
+        run: |
+          ./wrappers/ffgl/bundle-win.sh
+          ./examples/segcam-motion-ffgl/bundle-win.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -132,4 +148,5 @@ jobs:
             target/vfx-plugin/*.aex
             target/vfx-plugin/*.ofx.bundle
             target/vfx-plugin/*.dll
+            target/vfx-plugin/*.bundle
           if-no-files-found: error
