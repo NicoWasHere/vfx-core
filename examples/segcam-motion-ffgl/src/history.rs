@@ -1,6 +1,6 @@
 //! The last few frames, oldest first, with their allocations recycled at the front.
 
-use segcam_motion::{Argb, Channel, FrameSource, RenderSettings, View, ViewMut};
+use segcam_motion::{Argb, FrameSource, RenderSettings, View, ViewMut};
 use std::collections::VecDeque;
 
 #[derive(Default)]
@@ -23,25 +23,18 @@ impl History {
         self.height = height;
     }
 
-    pub fn push(&mut self, canvas: &[f32], settings: &RenderSettings) {
+    pub fn next(&mut self, settings: &RenderSettings) -> &mut [Argb<u8>] {
         let keep = segcam_motion::previous_frames_needed(settings) as usize + 1;
         while self.frames.len() > keep {
             self.frames.pop_front();
         }
-        let mut pixels = if self.frames.len() == keep {
+        let pixels = if self.frames.len() == keep {
             self.frames.pop_front().unwrap()
         } else {
             vec![Argb::default(); self.width as usize * self.height as usize]
         };
-        for (p, c) in pixels.iter_mut().zip(canvas.as_chunks::<4>().0) {
-            *p = Argb {
-                alpha: u8::from_unit(c[3]),
-                red: u8::from_unit(c[0]),
-                green: u8::from_unit(c[1]),
-                blue: u8::from_unit(c[2]),
-            };
-        }
         self.frames.push_back(pixels);
+        self.frames.back_mut().unwrap()
     }
 
     pub fn render(&mut self, settings: &RenderSettings, output: &mut [Argb<u8>]) {
@@ -62,17 +55,6 @@ impl FrameSource<u8> for History {
     }
 }
 
-pub fn to_canvas(pixels: &[Argb<u8>], canvas: &mut [f32]) {
-    for (p, c) in pixels.iter().zip(canvas.as_chunks_mut::<4>().0) {
-        *c = [
-            p.red.to_unit(),
-            p.green.to_unit(),
-            p.blue.to_unit(),
-            p.alpha.to_unit(),
-        ];
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,10 +66,20 @@ mod tests {
             background_frames: 1,
             ..RenderSettings::default()
         };
-        h.push(&[1.0; 8], &s);
+        h.next(&s).fill(Argb {
+            alpha: 255,
+            red: 255,
+            green: 255,
+            blue: 255,
+        });
         let first = h.frames[0].as_ptr();
-        h.push(&[0.0; 8], &s);
-        h.push(&[0.5; 8], &s);
+        h.next(&s).fill(Argb::default());
+        h.next(&s).fill(Argb {
+            alpha: 128,
+            red: 128,
+            green: 128,
+            blue: 128,
+        });
         assert_eq!(h.frames.len(), 2);
         assert_eq!(h.frames[1].as_ptr(), first);
         assert_eq!(h.frames[0][0].red, 0);
@@ -95,17 +87,27 @@ mod tests {
         s.mode = segcam_motion::OutputMode::Swarm;
         s.trail_frames = 3;
         for _ in 0..5 {
-            h.push(&[1.0; 8], &s);
+            h.next(&s).fill(Argb {
+                alpha: 255,
+                red: 255,
+                green: 255,
+                blue: 255,
+            });
         }
         assert_eq!(h.frames.len(), 4);
         s.mode = segcam_motion::OutputMode::Overlay;
-        h.push(&[1.0; 8], &s);
+        h.next(&s).fill(Argb {
+            alpha: 255,
+            red: 255,
+            green: 255,
+            blue: 255,
+        });
         assert_eq!(h.frames.len(), 2);
         h.clear();
         assert!(h.frames.is_empty());
         assert_eq!(h.frame, 0);
         h.resize(3, 2);
-        h.push(&[1.0; 24], &s);
+        h.next(&s);
         assert_eq!(h.frames[0].len(), 6);
     }
 }

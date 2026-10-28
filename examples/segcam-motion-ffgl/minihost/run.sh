@@ -17,4 +17,11 @@ esac
 cargo build --manifest-path "$here/../Cargo.toml" --release --quiet
 mkdir -p "$target/ffgl-minihost"
 "${CC:-cc}" -std=c11 -Wall -Wextra -Wno-cast-function-type -O1 '-DPLUGIN_NAME="segcam Motion"' "$root/wrappers/ffgl/minihost/minihost.c" -o "$host" "${libs[@]}"
-"$host" "$plugin" "${1:-segcam}"
+case_name="${1:-all}"
+"$host" "$plugin" "$case_name"
+if [ "$case_name" = all ] || [ "$case_name" = segcam ]; then
+  cargo build --manifest-path "$root/examples/segcam-motion/Cargo.toml" --no-default-features --bin segcam-motion --release --quiet
+  cli="$target/release/segcam-motion"
+  [ -f "$cli.exe" ] && cli="$cli.exe"
+  python3 "$here/compare.py" "$host" "$plugin" "$cli" "${@:2}"
+fi

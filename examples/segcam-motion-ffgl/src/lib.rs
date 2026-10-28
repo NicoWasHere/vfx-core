@@ -3,16 +3,17 @@
 
 mod history;
 mod params;
+mod transfer;
 
 use params::PARAMS;
 use std::ffi::{c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use vfx_ffgl_common::{ffi::*, gl, ram};
+use vfx_ffgl_common::{ffi::*, gl};
 use vfx_wrapper_common::diag;
 
 static LOG: diag::Log = diag::Log::new("SegcamMotionRust-FFGL.log");
 
-/// `text` in a fixed FFGL field, zero-padded. build.rs checks that it fits.
+/// `text` in a fixed FFGL field, zero-padded, checked at compile time.
 const fn padded<const N: usize>(text: &str) -> [u8; N] {
     let bytes = text.as_bytes();
     assert!(bytes.len() <= N, "too long for its FFGL field");
@@ -48,9 +49,8 @@ struct Instance {
     display: [u8; 16],
     blit: Option<gl::Blit>,
     output: gl::Texture,
-    ram: Option<ram::Canvas>,
+    ram: Option<transfer::Canvas>,
     history: history::History,
-    canvas: Vec<f32>,
     rendered: Vec<segcam_motion::Argb<u8>>,
 }
 
@@ -64,7 +64,6 @@ impl Instance {
             output: gl::Texture::new(),
             ram: None,
             history: history::History::default(),
-            canvas: Vec::new(),
             rendered: Vec::new(),
         }
     }
@@ -308,7 +307,7 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
             if let Some(old) = me.ram.take() {
                 old.delete();
             }
-            match ram::Canvas::new((w, h)) {
+            match transfer::Canvas::new((w, h)) {
                 Ok(canvas) => me.ram = Some(canvas),
                 Err(e) => {
                     LOG.note(&format!("warning: {e}"));
@@ -317,7 +316,6 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
             }
         }
         me.history.resize(w as i32, h as i32);
-        me.canvas.resize(w as usize * h as usize * 4, 0.0);
         me.rendered
             .resize(w as usize * h as usize, segcam_motion::Argb::default());
     }
@@ -325,19 +323,18 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
     let canvas = me.ram.as_ref().unwrap();
     // SAFETY: the context is current and the canvas has the declared image size.
     unsafe {
-        canvas.read_into(
+        canvas.read(
             tex.handle,
             (tex.hardware_width, tex.hardware_height),
             args.host_fbo,
-            &mut me.canvas,
+            me.history.next(&settings),
         )
     };
-    me.history.push(&me.canvas, &settings);
     me.history.render(&settings, &mut me.rendered);
-    history::to_canvas(&me.rendered, &mut me.canvas);
     // SAFETY: the output storage holds the full straight, top-down image.
     unsafe {
-        me.output.upload((w, h), &me.canvas);
+        me.output
+            .upload_bytes((w, h), transfer::bytes(&me.rendered));
         canvas.draw(me.output.handle);
     }
     LOG.note("render path: CPU through RAM (texture readback)");

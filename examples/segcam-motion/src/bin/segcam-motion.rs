@@ -25,7 +25,8 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --max-segments n                      (16)
   --grid columns                        (192)
   --trail frames  --max-tiles n         (24, 100)
-  --mirror  --no-boxes  --no-labels";
+  --mirror  --no-boxes  --no-labels
+  --straight-alpha                     (input and output, like After Effects)";
 
 /// The last few frames, oldest first: ffmpeg's argb is `Argb<u8>` byte for byte.
 struct Ring {
@@ -68,6 +69,7 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--grid" => s.grid_width = value()?.parse().ok()?,
             "--trail" => s.trail_frames = value()?.parse().ok()?,
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
+            "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,
             "--no-boxes" => s.boxes = false,
             "--no-labels" => s.labels = false,
