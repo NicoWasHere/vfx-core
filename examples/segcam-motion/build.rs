@@ -46,6 +46,10 @@ fn properties() -> Vec<Property> {
 }
 
 fn main() {
+    // Without the After Effects plugin (default-features = false) there's no PiPL to build.
+    if std::env::var_os("CARGO_FEATURE_AE").is_none() {
+        return;
+    }
     // Sets the PIPL_* env vars that the after-effects crate reads at compile time.
     pipl::plugin_build(properties());
 

@@ -14,7 +14,7 @@ pub mod render;
 pub mod swarm;
 
 // The lints are about code the after-effects crate's `define_effect!` writes.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(all(feature = "ae", any(target_os = "macos", target_os = "windows")))]
 #[allow(clippy::drop_non_drop, clippy::question_mark)]
 mod ae;
 
