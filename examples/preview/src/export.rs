@@ -15,6 +15,7 @@ use crate::effects::Effects;
 use crate::face::Detector;
 use crate::modulation::{self, Expressions};
 use crate::segcam::{self, Segcam};
+use crate::segcam_live;
 use crate::video::{Decoder, Encoder, Info};
 
 pub struct Export {
@@ -90,13 +91,21 @@ impl Export {
             );
             let controls = exprs.apply(base, &sources, dt);
             self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
-            let settings = segcam::settings(&controls);
-            self.segcam.push(pixels, settings.as_ref());
-            let source = self
-                .segcam
-                .output(settings)
-                .expect("a new frame is always shown");
-            effects.write_source(gpu, source);
+            if self.frame == 0 {
+                effects.reset_live();
+            }
+            if let Some(s) = segcam_live::settings(&controls) {
+                effects.write_source(gpu, &pixels);
+                effects.push_live(gpu, &pixels, &s);
+            } else {
+                let settings = segcam::settings(&controls);
+                self.segcam.push(pixels, settings.as_ref());
+                let source = self
+                    .segcam
+                    .output(settings)
+                    .expect("a new frame is always shown");
+                effects.write_source(gpu, source);
+            }
             let out = effects
                 .render(gpu, &controls, t, true)
                 .expect("capture returns the frame");

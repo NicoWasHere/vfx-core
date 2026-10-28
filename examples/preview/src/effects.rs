@@ -196,6 +196,9 @@ struct Frames {
     layer: Frame,
     /// The source mirrored, when Flip is on.
     flipped: Frame,
+    /// segcam-live's pile, when it's on.
+    #[cfg(not(target_arch = "wasm32"))]
+    swarm: Frame,
     feedback_out: Frame,
     /// Keeps its texture alive.
     display_view: wgpu::TextureView,
@@ -223,6 +226,8 @@ impl Frames {
             source: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
             layer: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
             flipped: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
+            #[cfg(not(target_arch = "wasm32"))]
+            swarm: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
             feedback_out: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
             display_view,
         }
@@ -240,6 +245,9 @@ pub struct Effects {
     /// Mirrors the source before the shared pipeline.
     flip: EffectChain,
     feedback: EffectChain,
+    /// segcam-live's windows, drawn in place of a video's frames while it's on.
+    #[cfg(not(target_arch = "wasm32"))]
+    live: crate::segcam_live::Live,
 }
 
 impl Effects {
@@ -272,6 +280,8 @@ impl Effects {
             display_pass,
             flip: EffectChain::new(),
             feedback: EffectChain::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            live: Default::default(),
         };
         effects.flip.push(Box::new(Flip::default()));
         effects.flip.prepare(gpu, FRAME_FORMAT, PATTERN_SIZE);
@@ -342,6 +352,7 @@ impl Effects {
         self.set_size(gpu, size);
         let frame = Frame::new(gpu, size.0, size.1, FRAME_FORMAT);
         self.image = Some((name, frame));
+        self.live.reset();
     }
 
     /// Replaces the source's pixels (float RGBA at the source size).
@@ -350,6 +361,20 @@ impl Effects {
         if let Some((_, frame)) = &self.image {
             frame.write(gpu, bytemuck::cast_slice(pixels));
         }
+    }
+
+    /// Hands segcam-live the frame just written with [`Effects::write_source`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn push_live(&mut self, gpu: &Gpu, pixels: &[f32], s: &crate::segcam_live::Settings) {
+        if let Some((_, frame)) = &self.image {
+            self.live.push(gpu, frame, pixels, s);
+        }
+    }
+
+    /// Clears segcam-live's pile, after a seek.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reset_live(&mut self) {
+        self.live.reset();
     }
 
     /// Goes back to the generated patterns.
@@ -430,6 +455,16 @@ impl Effects {
                 );
                 &self.frames.source
             }
+        };
+        // segcam-live's pile replaces a video's frames once it has seen one.
+        #[cfg(not(target_arch = "wasm32"))]
+        let source = match crate::segcam_live::settings(controls) {
+            Some(s) if self.image.is_some() && self.live.started() => {
+                self.live.expire(&s);
+                self.live.draw(gpu, &mut encoder, &self.frames.swarm);
+                &self.frames.swarm
+            }
+            _ => source,
         };
         // Flip first, so clicks on the image and face positions match what's shown.
         // The flip submits its own pass, so a generated pattern has to land first.

@@ -13,35 +13,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use segcam_motion::{Argb, Channel, FrameSource, OutputMode, RenderSettings, View, ViewMut};
 
 use crate::controls::Controls;
-use crate::segcam_live::{self, Live};
 
-/// What segcam draws.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Look {
-    /// segcam-motion as After Effects runs it, rebuilt from the frames before each one.
-    Motion(RenderSettings),
-    /// segcam-live: the swarm with its pile kept between frames.
-    Live(segcam_live::Settings),
-}
-
-/// segcam's settings from the panel, or None while it is switched off. segcam-live
-/// takes over while it is on.
-pub fn settings(c: &Controls) -> Option<Look> {
-    if c.segcam_live_on {
-        let motion = segcam_motion::MotionSettings {
-            sensitivity: f64::from(c.segcam_live_sensitivity.clamp(0.0, 1.0)),
-            min_area_fraction: f64::from(c.segcam_live_min_size.max(0.0)) / 100.0,
-            max_segments: c.segcam_live_max_segments as _,
-            ..Default::default()
-        };
-        return Some(Look::Live(segcam_live::Settings {
-            motion,
-            background_frames: c.segcam_live_background,
-            grid_width: RenderSettings::default().grid_width,
-            lifetime: c.segcam_live_lifetime.max(1.0).round() as u32,
-            max_tiles: c.segcam_live_max_tiles,
-        }));
-    }
+/// segcam's settings from the panel, or None while it is switched off.
+pub fn settings(c: &Controls) -> Option<RenderSettings> {
     if !c.segcam_on {
         return None;
     }
@@ -57,7 +31,7 @@ pub fn settings(c: &Controls) -> Option<Look> {
     s.motion.sensitivity = f64::from(c.segcam_sensitivity.clamp(0.0, 1.0));
     s.motion.min_area_fraction = f64::from(c.segcam_min_size.max(0.0)) / 100.0;
     s.motion.max_segments = c.segcam_max_segments as _;
-    Some(Look::Motion(s))
+    Some(s)
 }
 
 /// The newest decoded frame and, while segcam is on, the frames before it.
@@ -74,11 +48,7 @@ pub struct Segcam {
     /// A frame arrived since the last output.
     fresh: bool,
     /// The settings the last output was made with (None: segcam off).
-    shown: Option<Option<Look>>,
-    live: Live,
-    /// segcam-live has had a frame since it was switched on or reset.
-    live_started: bool,
-    argb: Vec<Argb<u8>>,
+    shown: Option<Option<RenderSettings>>,
 }
 
 impl Segcam {
@@ -92,17 +62,12 @@ impl Segcam {
             pixels: Vec::new(),
             fresh: false,
             shown: None,
-            live: Live::default(),
-            live_started: false,
-            argb: Vec::new(),
         }
     }
 
     /// Forgets the history, after a seek: the frames before it no longer lead up to it.
     pub fn reset(&mut self) {
         self.history.clear();
-        self.live.reset();
-        self.live_started = false;
     }
 
     /// Shows the newest frame again, after something else (an export) used the source.
@@ -111,40 +76,31 @@ impl Segcam {
     }
 
     /// Takes the next frame, adding it to the history while segcam is on.
-    pub fn push(&mut self, pixels: Vec<f32>, look: Option<&Look>) {
+    pub fn push(&mut self, pixels: Vec<f32>, settings: Option<&RenderSettings>) {
         self.raw = Some(pixels);
         self.fresh = true;
-        match look {
-            Some(Look::Motion(s)) => {
-                self.live.reset();
-                self.live_started = false;
-                self.record(s);
-            }
-            Some(Look::Live(s)) => {
-                self.history.clear();
-                self.feed_live(s);
-            }
-            None => self.reset(),
+        match settings {
+            Some(s) => self.record(s),
+            None => self.history.clear(),
         }
-    }
-
-    fn feed_live(&mut self, s: &segcam_live::Settings) {
-        let Some(raw) = &self.raw else {
-            return;
-        };
-        segcam_live::to_argb(raw, &mut self.argb);
-        let view = View::from_pixels(&self.argb, self.size.0 as i32, self.size.1 as i32);
-        self.live.push(&view, s);
-        self.live_started = true;
     }
 
     fn record(&mut self, s: &RenderSettings) {
         let Some(raw) = &self.raw else {
             return;
         };
-        let mut frame = Vec::new();
-        segcam_live::to_argb(raw, &mut frame);
-        self.history.push_back(frame);
+        self.history.push_back(
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&[r, g, b, a]| Argb {
+                    alpha: u8::from_unit(a),
+                    red: u8::from_unit(r),
+                    green: u8::from_unit(g),
+                    blue: u8::from_unit(b),
+                })
+                .collect(),
+        );
         self.frame += 1;
         let keep = segcam_motion::previous_frames_needed(s) as usize + 1;
         while self.history.len() > keep {
@@ -154,32 +110,16 @@ impl Segcam {
 
     /// The source pixels to show, when they changed: a new frame came in or the settings
     /// changed. Paused, segcam re-renders the same history as its settings change.
-    pub fn output(&mut self, look: Option<Look>) -> Option<&[f32]> {
+    pub fn output(&mut self, settings: Option<RenderSettings>) -> Option<&[f32]> {
         self.raw.as_ref()?;
         let fresh = std::mem::take(&mut self.fresh);
-        if !fresh && self.shown == Some(look) {
+        if !fresh && self.shown == Some(settings) {
             return None;
         }
-        self.shown = Some(look);
-        let s = match look {
-            None => {
-                self.reset();
-                return self.raw.as_deref();
-            }
-            Some(Look::Live(s)) => {
-                // Switched on since the last frame came in.
-                if !self.live_started {
-                    self.feed_live(&s);
-                }
-                self.live.expire(&s);
-                let (w, h) = (self.size.0 as i32, self.size.1 as i32);
-                self.out
-                    .resize(self.size.0 as usize * self.size.1 as usize, Argb::default());
-                self.live
-                    .draw(&mut ViewMut::from_pixels(&mut self.out, w, h));
-                return Some(self.pixels_from_out());
-            }
-            Some(Look::Motion(s)) => s,
+        self.shown = Some(settings);
+        let Some(s) = settings else {
+            self.history.clear();
+            return self.raw.as_deref();
         };
         // Switched on since the last frame came in.
         if self.history.is_empty() {
@@ -201,17 +141,14 @@ impl Segcam {
         };
         let mut view = ViewMut::from_pixels(&mut self.out, w, h);
         segcam_motion::render(&s, &mut source, count, self.frame, &mut view);
-        Some(self.pixels_from_out())
-    }
 
-    fn pixels_from_out(&mut self) -> &[f32] {
         self.pixels.clear();
         self.pixels.extend(
             self.out
                 .iter()
                 .flat_map(|p| [p.red, p.green, p.blue, p.alpha].map(Channel::to_unit)),
         );
-        &self.pixels
+        Some(&self.pixels)
     }
 }
 
@@ -241,7 +178,7 @@ pub struct Worker {
 
 struct Shared {
     frames: VecDeque<Vec<f32>>,
-    settings: Option<Look>,
+    settings: Option<RenderSettings>,
     reset: bool,
     redraw: bool,
     /// The newest output, until the app uploads it.
@@ -250,7 +187,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn has_work(&self, settings: Option<Look>) -> bool {
+    fn has_work(&self, settings: Option<RenderSettings>) -> bool {
         !self.frames.is_empty() || self.redraw || self.reset || self.settings != settings
     }
 }
@@ -318,7 +255,7 @@ impl Worker {
     }
 
     /// Settings for the frames from here on; re-renders the current one when they change.
-    pub fn set(&self, settings: Option<Look>) {
+    pub fn set(&self, settings: Option<RenderSettings>) {
         let (lock, wake) = &*self.shared;
         let mut s = lock.lock().unwrap();
         if s.settings != settings {
@@ -379,7 +316,7 @@ mod tests {
             .any(|p| p[1] > 0.9 && p[0] < 0.5 && p[2] < 0.5)
     }
 
-    fn on() -> Option<Look> {
+    fn on() -> Option<RenderSettings> {
         settings(&Controls {
             segcam_on: true,
             ..Controls::default()

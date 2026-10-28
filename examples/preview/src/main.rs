@@ -278,6 +278,9 @@ impl Preview {
     /// Works out this frame's expression variables, then renders either the live preview or
     /// the next stretch of a running export.
     fn render_effects(&mut self, dt: f64) {
+        // A new video frame, uploaded below once expressions have set segcam's parameters.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut fresh = None;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(media) = &mut self.media {
             if let Some(export) = &mut media.export {
@@ -300,6 +303,7 @@ impl Preview {
                 self.exprs.reset();
                 self.effects.rebuild_feedback(&self.gpu);
                 media.segcam.redraw();
+                self.effects.reset_live();
                 if self.sound_on {
                     media.sound = video::Sound::play(&media.video.info, media.video.position());
                 }
@@ -314,15 +318,17 @@ impl Preview {
                 scrub.last_seek = Instant::now();
                 media.sound = None;
                 media.segcam.reset();
+                self.effects.reset_live();
                 if let Err(e) = media.video.seek(position, false) {
                     self.message = Some(e);
                 }
             }
             // Loop at the end.
-            if media.video.ended()
-                && let Err(e) = media.seek(0.0, true, self.sound_on)
-            {
-                self.message = Some(e);
+            if media.video.ended() {
+                self.effects.reset_live();
+                if let Err(e) = media.seek(0.0, true, self.sound_on) {
+                    self.message = Some(e);
+                }
             }
 
             // Uploaded below, once expressions have set segcam's parameters.
@@ -330,7 +336,7 @@ impl Preview {
                 if let Some(tracker) = &self.tracker {
                     tracker.submit(pixels.clone(), media.video.info.size);
                 }
-                media.segcam.push(pixels);
+                fresh = Some(pixels);
             }
             let position = media.video.position();
             self.sources = modulation::sources(
@@ -360,8 +366,24 @@ impl Preview {
         self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(media) = &self.media {
-            media.segcam.set(segcam::settings(&controls));
-            if let Some(pixels) = media.segcam.take() {
+            // segcam-live takes over from segcam motion while it's on: frames go straight
+            // to the GPU, which draws its windows.
+            let live = segcam_live::settings(&controls);
+            if let Some(pixels) = fresh {
+                if let Some(s) = &live {
+                    self.effects.write_source(&self.gpu, &pixels);
+                    self.effects.push_live(&self.gpu, &pixels, s);
+                }
+                media.segcam.push(pixels);
+            }
+            media.segcam.set(
+                live.is_none()
+                    .then(|| segcam::settings(&controls))
+                    .flatten(),
+            );
+            if let Some(pixels) = media.segcam.take()
+                && live.is_none()
+            {
                 self.effects.write_source(&self.gpu, &pixels);
             }
         }
@@ -427,6 +449,7 @@ impl Preview {
             scrub.pending = Some(position);
         }
         if let Some(position) = actions.scrub_done {
+            self.effects.reset_live();
             let resume = media
                 .scrub
                 .take()
