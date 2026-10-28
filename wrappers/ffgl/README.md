@@ -38,9 +38,18 @@ which the plugin's Metal device renders from and back into a second IOSurface, a
 is drawn into Resolume's framebuffer. The conversions FFGL needs (premultiplied alpha,
 bottom-up rows) happen in those two draws.
 
-If the shared surfaces can't be set up, the plugin reads the texture back through RAM
-instead, and if the GPU fails it draws the input unchanged. Windows uses this RAM
-path. Headless GPU setup uses Vulkan, Metal or DX12 so wgpu leaves the host's
+On Windows, two dedicated RGBA32F Vulkan images are shared with OpenGL through
+`GL_EXT_memory_object_win32`. The plugin selects a Vulkan device with the same LUID
+as the host's GL device, draws the input into one image, renders the chain, and draws
+the other into the host's framebuffer. Shared Win32 semaphores and Vulkan external
+queue-family barriers transfer image ownership and layout between the APIs. GL and
+wgpu also finish their work before the other API starts. No pixels pass through RAM.
+
+If sharing can't be set up (missing extensions, a device mismatch, unsupported export
+formats or a setup error), the plugin reads the texture back through RAM instead.
+A Windows shared render error also disables sharing for that instance and uses RAM;
+if RAM rendering fails, the plugin draws the input unchanged.
+Headless GPU setup uses Vulkan, Metal or DX12 so wgpu leaves the host's
 OpenGL context alone. On Windows, GL draws convert the row order and alpha before
 readback and after upload; the RAM buffers already match the pipeline's canvas.
 The pipeline reuses its readback buffer and copies straight into float storage.
@@ -55,16 +64,19 @@ Measured on an Apple M5 with blur radius 8 and the vignette on:
 | GPU-native (IOSurface) | 3.3 ms | 6.4 ms |
 | Through RAM | 11.2 ms | 24.0 ms |
 
-On Windows with an AMD Radeon RX 5700 XT 50th Anniversary, the release mini host
-measured the same effect settings over 30 frames after a warm-up frame (median of
-three runs):
+On Windows with an AMD Radeon RX 5700 XT 50th Anniversary (driver
+26.10.1.261008), the release mini host measured the same effect settings over 30
+frames after a warm-up frame. These are medians of three alternating baseline
+(`1cdef96`, RAM) and shared-image runs:
 
 | | 720p | 1080p |
 |---|---|---|
-| Through RAM | 28.1 ms | 48.7 ms |
+| Through RAM (before) | 23.7 ms | 49.7 ms |
+| GPU-native (shared Vulkan images) | 2.8 ms | 3.7 ms |
 
 The earlier CPU conversion path measured 48.6 / 97.8 ms in alternating runs on the
-same machine. RAM transfers still keep this path above the 16.7 ms budget for 60 fps.
+same machine. GPU sharing brings both sizes below the 16.7 ms budget for 60 fps.
+The earlier RAM measurement was 28.1 / 48.7 ms; RAM timings vary between runs.
 
 ## Testing without Resolume
 
@@ -80,8 +92,22 @@ set in `CC` (default `cc`). It also checks that the host's context and device co
 stay current across rendering, including the first GPU setup. The Windows mini host
 runs locally; CI runs the unit tests and builds the DLL.
 
+The Windows `sharing` case compares automatic and forced-RAM rendering within one
+process, including two interleaved shared instances, resizing, padded input, zero
+alpha, HDR, linear light and effects. To require sharing and reject any silent
+fallback, run from Git Bash:
+
+```bash
+FFGL_MINIHOST_REQUIRE_INTEROP=1 wrappers/ffgl/minihost/run.sh
+VFX_FFGL_PATH=ram wrappers/ffgl/minihost/run.sh
+```
+
+The strict check requires a Vulkan path entry from the current process in the log
+and rejects shared setup/render warnings. Leave it unset on a machine without the
+sharing extensions to exercise automatic RAM fallback.
+
 ## Not yet
 
-- Resolume on Windows has not been tested. The Windows RAM path passes the mini host.
-- GPU-native frames on Windows. Sharing textures with wgpu needs vendor-specific interop.
+- Resolume on Windows has not been tested. Both Windows paths pass the mini host on
+  the RX 5700 XT; other drivers and multi-GPU hosts are untested.
 - A thumbnail for Resolume's effect browser, and beat-synced parameters.

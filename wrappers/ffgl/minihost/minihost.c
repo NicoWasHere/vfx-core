@@ -9,12 +9,16 @@
  *
  *   minihost <plugin binary> [case]   cases: all (default), info, passthrough,
  *                                     brightness, padding, blur, vignette, state, timing
- * Windows also checks rejection without a current context (case: context).
+ * Windows also checks context rejection and sharing/RAM pixel parity (context, sharing).
+ * FFGL_MINIHOST_REQUIRE_INTEROP=1 rejects fallback during an automatic-path run.
  * Exit status 0 when every check passes.
  */
 #define GL_SILENCE_DEPRECATION
 #ifndef PLUGIN_NAME
 #define PLUGIN_NAME "VFX Preview" /* run.sh passes the one in plugin.env */
+#endif
+#ifndef PLUGIN_LOG
+#define PLUGIN_LOG "VfxPreview-FFGL.log" /* run.sh passes <PLUGIN_FILE>-FFGL.log */
 #endif
 
 #include <math.h>
@@ -540,10 +544,103 @@ static void case_timing(void) {
     }
 }
 
+#ifdef _WIN32
+/* Check only this process's log entries, never a successful path from an earlier run. */
+static int logged_message(const char *message) {
+    char name[MAX_PATH], prefix[64], line[2048];
+    DWORD n = GetTempPathA(sizeof name, name);
+    if (!n || n + strlen(PLUGIN_LOG) >= sizeof name) return 0;
+    strcat(name, PLUGIN_LOG);
+    FILE *log = fopen(name, "r");
+    if (!log) return 0;
+    snprintf(prefix, sizeof prefix, "[pid %lu] ", GetCurrentProcessId());
+    int found = 0;
+    while (fgets(line, sizeof line, log)) if (!strncmp(line, prefix, strlen(prefix)) && strstr(line, message)) found = 1;
+    fclose(log);
+    return found;
+}
+
+static void free_frame(Frame *f) {
+    typedef void (APIENTRY *DeleteFramebuffers)(GLsizei, const GLuint *);
+    typedef void (APIENTRY *DeleteTextures)(GLsizei, const GLuint *);
+    ((DeleteFramebuffers)gl_proc("glDeleteFramebuffers"))(1, &f->target.fbo);
+    DeleteTextures delete_textures = (DeleteTextures)gl_proc("glDeleteTextures");
+    delete_textures(1, &f->target.color);
+    delete_textures(1, &f->input);
+    free(f->straight);
+    free(f->out);
+}
+
+static void case_sharing(void) {
+    const char *original = getenv("VFX_FFGL_PATH");
+    char *saved = original ? strdup(original) : NULL;
+    void *automatic = instantiate(63, 37);
+    void *peer = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", "ram");
+    void *ram = instantiate(63, 37);
+    _putenv_s("VFX_FFGL_PATH", saved ? saved : "");
+    free(saved);
+    /* Reuse instances across sizes, settings, padding, transparent and HDR pixels. */
+    int sizes[][2] = {{63, 37}, {17, 13}, {63, 37}};
+    for (int s = 0; s < 3; s++) {
+        Frame f = frame(sizes[s][0], sizes[s][1], 80, 48);
+        float *pixels = calloc((size_t)f.hw * f.hh * 4, sizeof(float));
+        pattern(f.straight, pixels, f.w, f.h, f.hw);
+        for (int y = 0; y < f.h; y++) for (int x = 0; x < f.w; x++) {
+            float *p = px(pixels, f.hw, x, y);
+            if (x == 0) { p[0] = 4.0f; p[1] = 2.0f; }
+            if (y == 0) { p[0] = p[1] = p[2] = p[3] = 0; }
+        }
+        glBindTexture(GL_TEXTURE_2D, f.input);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, f.hw, f.hh, 0, GL_RGBA, GL_FLOAT, pixels);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        free(pixels);
+        void *instances[] = {automatic, peer, ram};
+        for (int i = 0; i < 3; i++) {
+            set(instances[i], "Brightness", s ? 0.2f : 0);
+            set(instances[i], "Blur Radius", s == 2 ? 3 : 0);
+            set(instances[i], "Vignette", s == 1 ? 1 : 0);
+            set(instances[i], "Linear Light", s == 2 ? 1 : 0);
+        }
+        float *reference = malloc((size_t)f.w * f.h * 4 * sizeof(float));
+        for (int repeat = 0; repeat < 3; repeat++) {
+            CHECK(render(automatic, &f), "automatic sharing render");
+            memcpy(reference, f.out, (size_t)f.w * f.h * 4 * sizeof(float));
+            CHECK(render(peer, &f), "second shared instance render");
+            float peer_worst = 0;
+            for (int i = 0; i < f.w * f.h * 4; i++) {
+                float diff = fabsf(reference[i] - f.out[i]);
+                if (!isfinite(f.out[i])) { peer_worst = INFINITY; break; }
+                if (diff > peer_worst) peer_worst = diff;
+            }
+            CHECK(peer_worst < 1e-4f, "shared instance mismatch: %g", peer_worst);
+            CHECK(render(ram, &f), "forced RAM reference render");
+            float worst = 0;
+            for (int i = 0; i < f.w * f.h * 4; i++) {
+                float diff = fabsf(reference[i] - f.out[i]);
+                if (!isfinite(reference[i]) || !isfinite(f.out[i])) { worst = INFINITY; break; }
+                if (diff > worst) worst = diff;
+            }
+            CHECK(worst < 1e-4f, "sharing/RAM mismatch at size %d repeat %d: %g", s, repeat, worst);
+            CHECK(glGetError() == GL_NO_ERROR, "sharing left a GL error");
+        }
+        free(reference);
+        free_frame(&f);
+    }
+    call(DEINSTANTIATE_GL, u(0), automatic);
+    call(DEINSTANTIATE_GL, u(0), peer);
+    call(DEINSTANTIATE_GL, u(0), ram);
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(logged_message("render path: GPU-native (Vulkan"), "Vulkan shared path did not run in this process");
+    }
+}
+#endif
+
 typedef struct { const char *name; void (*run)(void); } Case;
 static Case cases[] = {
 #ifdef _WIN32
     {"context", case_context},
+    {"sharing", case_sharing},
 #endif
     {"info", case_info}, {"passthrough", case_passthrough}, {"brightness", case_brightness},
     {"padding", case_padding}, {"blur", case_blur}, {"vignette", case_vignette},
@@ -596,6 +693,13 @@ int main(int argc, char **argv) {
         ran++;
     }
     call(DEINITIALISE, u(0), NULL);
+#ifdef _WIN32
+    if (getenv("FFGL_MINIHOST_REQUIRE_INTEROP")) {
+        CHECK(logged_message("render path: GPU-native (Vulkan"), "required Vulkan shared path absent from this process's log");
+        CHECK(!logged_message("warning: zero-copy path unavailable"), "shared setup fell back during this run");
+        CHECK(!logged_message("warning: shared GPU render failed"), "shared rendering fell back during this run");
+    }
+#endif
     if (!ran) { fprintf(stderr, "unknown case %s\n", only); return 2; }
     printf("%d case(s), %d failure(s)\n", ran, failures);
 #ifdef _WIN32

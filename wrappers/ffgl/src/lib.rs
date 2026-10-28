@@ -3,8 +3,9 @@
 //!
 //! The host calls `plugMain` on its GL thread with its context current. On macOS each
 //! frame goes GPU to GPU: the host's texture is drawn into an IOSurface that the
-//! plugin's Metal device renders from (see `surface`). Elsewhere, or if that can't be
-//! set up, the texture is read back through RAM, rendered, and uploaded again. If the
+//! plugin's Metal device renders from (see `surface`). Windows shares Vulkan images
+//! with OpenGL (see `shared`). Elsewhere, or if sharing can't be set up, the texture
+//! is read back through RAM, rendered, and uploaded again. If the
 //! GPU path fails, the input is drawn unchanged.
 //!
 //! `VFX_FFGL_PATH=ram` forces the RAM path, for comparing the two.
@@ -16,6 +17,8 @@ mod gl;
 mod params;
 #[cfg(target_os = "windows")]
 mod ram;
+#[cfg(target_os = "windows")]
+mod shared;
 #[cfg(target_os = "macos")]
 mod surface;
 
@@ -89,7 +92,9 @@ struct Instance {
     ram: Option<ram::Canvas>,
     #[cfg(target_os = "macos")]
     interop: Option<surface::Interop>,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
+    interop: Option<shared::Interop>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     /// Set once the zero-copy path has failed to set up, so it isn't retried per frame.
     interop_failed: bool,
 }
@@ -104,9 +109,9 @@ impl Instance {
             output: gl::Texture::new(),
             #[cfg(target_os = "windows")]
             ram: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             interop: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             interop_failed: std::env::var("VFX_FFGL_PATH").as_deref() == Ok("ram"),
         }
     }
@@ -262,7 +267,7 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                     if let Some(blit) = instance.blit.take() {
                         blit.delete();
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Some(interop) = instance.interop.take() {
                         interop.delete();
                     }
@@ -349,10 +354,59 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         blit.draw(tex.handle, gl::TEXTURE_2D, max_uv);
         true
     };
+    let settings = params::settings(&me.values, w, h);
+
+    #[cfg(target_os = "windows")]
+    if !me.interop_failed {
+        if me.interop.as_ref().is_none_or(|i| i.size() != (w, h)) {
+            // SAFETY: the current context owns the old shared objects.
+            if let Some(old) = me.interop.take() {
+                unsafe { old.delete() };
+            }
+            // SAFETY: the caller has the host's context current.
+            match unsafe { shared::Interop::new((w, h)) } {
+                Ok(interop) => me.interop = Some(interop),
+                Err(e) => {
+                    LOG.note(&format!(
+                        "warning: zero-copy path unavailable, using RAM: {e}"
+                    ));
+                    me.interop_failed = true;
+                }
+            }
+        }
+        if let Some(interop) = &me.interop {
+            // SAFETY: the context is current and the host supplies its texture and FBO.
+            let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
+                interop.render(
+                    &settings,
+                    me.time,
+                    tex.handle,
+                    (tex.hardware_width, tex.hardware_height),
+                    args.host_fbo,
+                )
+            }));
+            match rendered {
+                Ok(Ok(())) => {
+                    LOG.note("render path: GPU-native (Vulkan shared with OpenGL, no CPU copies)");
+                    return true;
+                }
+                Ok(Err(e)) => {
+                    LOG.note(&format!(
+                        "warning: shared GPU render failed, using RAM: {e}"
+                    ));
+                    me.interop_failed = true;
+                }
+                Err(_) => {
+                    LOG.note("warning: shared GPU render failed, using RAM");
+                    me.interop_failed = true;
+                }
+            }
+        }
+    }
+
     let Some(gpu) = gpu() else {
         return pass_through(blit);
     };
-    let settings = params::settings(&me.values, w, h);
 
     #[cfg(target_os = "macos")]
     if !me.interop_failed {

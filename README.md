@@ -8,7 +8,7 @@ for several hosts:
 | Core library | `vfx-core` (repo root) | any Rust app | tested headless on macOS, Windows, Linux |
 | After Effects | `wrappers/adobe` | After Effects 2026 (Premiere untested) | tested in AE; SmartFX, 8/16/32 bpc, Multi-Frame Rendering, GPU-native on Metal |
 | OpenFX | `wrappers/ofx` | DaVinci Resolve, Nuke, Natron… | passes a mini host on macOS and Windows; loads in Resolve 21 on macOS (the Mac App Store build hides third-party OpenFX); renders in Natron 2.5 on Windows |
-| FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17 on macOS; zero-copy via IOSurface; passes the mini host on Windows through RAM |
+| FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17 on macOS; GPU sharing via IOSurface on macOS and Vulkan on Windows; both Windows paths pass the mini host |
 | Preview app | `examples/preview` | desktop and browser (WebGPU) | egui control panel; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 
 Every target renders the same effect chain through the same code, so a frame looks the
@@ -46,7 +46,7 @@ wrappers/
     examples/ae_reference.rs   the plugin's pipeline without After Effects, for that harness
   ofx/                  OpenFX plugin, hand-written bindings to the OpenFX 1.4 C API
     minihost/           a small OpenFX host in C for testing without an application
-  ffgl/                 FFGL 2.1 plugin for Resolume, OpenGL + IOSurface interop
+  ffgl/                 FFGL 2.1 plugin for Resolume, OpenGL + IOSurface / Vulkan interop
     minihost/           a small FFGL host in C with a headless OpenGL context
 examples/preview/       standalone app: egui panel, native and web
   web/                  index.html and build.sh for the WebGPU build
@@ -165,7 +165,8 @@ those, each host has its own harness:
   is the FFGL host's. The preview creates its own instance.
 - **GPU-native paths where hosts allow it.** After Effects with Metal acceleration hands
   over `MTLBuffer`s: the plugin opens wgpu on After Effects' own device and wraps them.
-  Resolume's GL textures are drawn into IOSurfaces that wgpu's Metal device shares. Both
+  Resolume's GL textures are drawn into IOSurfaces that wgpu's Metal device shares,
+  or Vulkan images shared with OpenGL on Windows. These paths
   avoid any CPU copy; everything else (and any setup failure) goes through RAM, and a GPU
   failure passes the frame through unchanged rather than failing the host's render.
 - **Hand-written host bindings.** OpenFX and FFGL are small C ABIs, transcribed from
@@ -182,8 +183,8 @@ those, each host has its own harness:
   - After Effects: the `.aex` builds in CI but hasn't been tested in After Effects.
   - OpenFX: passes the mini host and renders in Natron 2.5, but hasn't been tried in
     Resolve on Windows yet.
-  - FFGL: passes the mini host through RAM, but has not been tried in Resolume on
-    Windows. GPU-native texture sharing is not done.
+  - FFGL: GPU sharing and RAM both pass the mini host on an RX 5700 XT, but have not
+    been tried in Resolume on Windows or on other drivers.
 - Premiere Pro is untested. Signing and notarization have never been run.
 - OpenFX GPU rendering (Resolve's Metal extension) and an FFGL thumbnail aren't done.
 - Hosts with no plugin yet: TouchDesigner (a Custom TOP, or the shaders as a GLSL
