@@ -38,8 +38,8 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 ## How it renders
 
 After Effects can ask for any frame in any order, on any thread, so the effect keeps no
-state between renders. Pre-render checks out the **Background frames** before the current
-one (plus **Swarm trail frames** - 1 in Swarm mode), and render hands them to the core one
+state between renders. Pre-render checks out the **Background** before the current
+one (plus **Trail frames** - 1 in Swarm mode), and render hands them to the core one
 at a time through `FrameSource::with_frame`. Each frame is held only while the core boils
 it down to a luma grid (and, for the swarm, cuts its tiles), then checked back in. So
 memory stays flat however many frames it reads. The background is rebuilt for every frame
@@ -57,7 +57,7 @@ to the GPU on every render would cost more than the work itself.
 
 The plugin installs alongside segcam's own: its bundle is `SegcamMotionRust.plugin`, its
 match name is `LOFISCIFI segcam Motion Rust`, and it appears as
-**Effect ▸ LO.FI.SCI.FI ▸ segcam Motion (Rust)**. Projects saved with one effect don't
+**Effect â–¸ LO.FI.SCI.FI â–¸ segcam Motion (Rust)**. Projects saved with one effect don't
 switch to the other.
 
 ```bash
@@ -117,3 +117,38 @@ effect, renders them with `aerender`, and checks three things:
 - The movers were found.
 
 `--clip` uses real footage instead of the generated squares.
+
+## OpenFX
+
+`../segcam-motion-ofx` builds the same CPU effect for Resolve, Nuke and Natron:
+
+```bash
+bash examples/segcam-motion-ofx/bundle-win.sh
+# On macOS (both Rust targets must be installed):
+bash examples/segcam-motion-ofx/bundle-mac.sh
+```
+
+Copy `target/vfx-plugin/SegcamMotionRust.ofx.bundle` into the host's OpenFX plugin
+folder, or point `OFX_PLUGIN_PATH` at `target/vfx-plugin`. On Windows the usual
+folder is `C:\Program Files\Common Files\OFX\Plugins`; on macOS it is
+`/Library/OFX/Plugins`. The effect is **LO.FI.SCI.FI / segcam Motion (Rust)**,
+identifier `com.lofiscifi.SegcamMotionRust`.
+
+It declares temporal access and requests the background and swarm history from the
+host. Each source image is released as soon as the core has read it. RGBA images are
+converted to top-down ARGB, with either sign of row stride; 8-bit renders in u8,
+16-bit (white 65535) and float render in float. The host's alpha convention is kept.
+The controls match After Effects, including the shorter **Background** and **Trail
+frames** labels.
+
+The C host in `../segcam-motion-ofx/tests` compares a 32-frame, 320x180 moving-square
+sequence with the CLI in Overlay, Motion matte and Swarm, at all three depths, both
+row orders, and straight and premultiplied alpha. Set `OFX_INCLUDE` to the official
+OpenFX headers and `SEGCAM_TEST_DIR` to a scratch folder, then run
+`bash examples/segcam-motion-ofx/tests/run.sh`. The CLI's `--straight-alpha` option
+selects the straight-alpha convention for that comparison; `--float` renders the same
+8-bit stream with the float core for the 16-bit and float host reference. The default
+is unchanged. High-depth outputs are compared after rounding to 8-bit levels; this
+is not a native 16-bit or HDR precision check.
+Natron 2.5 on Windows has rendered the overlay with temporal input. Resolve, Nuke
+and macOS host validation are still pending.

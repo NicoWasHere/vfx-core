@@ -96,6 +96,18 @@ jobs:
           git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
           CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" ./wrappers/ofx/minihost/run.sh
 
+      - name: segcam Motion OpenFX tests and bundle
+        shell: bash
+        run: |
+          cargo test -p segcam-motion-ofx --no-default-features
+          cargo clippy -p segcam-motion-ofx -p segcam-motion -p vfx-ofx --no-default-features --all-targets -- -D warnings
+          CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" bash examples/segcam-motion-ofx/tests/run.sh
+          if [ "$RUNNER_OS" = Windows ]; then
+            bash examples/segcam-motion-ofx/bundle-win.sh
+          else
+            bash examples/segcam-motion-ofx/bundle-mac.sh
+          fi
+
       - name: Build Windows OpenFX bundle
         if: runner.os == 'Windows'
         shell: bash
