@@ -41,7 +41,9 @@ bottom-up rows) happen in those two draws.
 If the shared surfaces can't be set up, the plugin reads the texture back through RAM
 instead, and if the GPU fails it draws the input unchanged. Windows uses this RAM
 path. Headless GPU setup uses Vulkan, Metal or DX12 so wgpu leaves the host's
-OpenGL context alone.
+OpenGL context alone. On Windows, GL draws convert the row order and alpha before
+readback and after upload; the RAM buffers already match the pipeline's canvas.
+The pipeline reuses its readback buffer and copies straight into float storage.
 
 `~/Library/Logs/VfxFfgl.log` records which path ran on macOS. On Windows the log is
 `%TEMP%\VfxFfgl.log`. `VFX_FFGL_PATH=ram` forces the RAM path.
@@ -54,11 +56,15 @@ Measured on an Apple M5 with blur radius 8 and the vignette on:
 | Through RAM | 11.2 ms | 24.0 ms |
 
 On Windows with an AMD Radeon RX 5700 XT 50th Anniversary, the release mini host
-measured the same effect settings over 30 frames after a warm-up frame:
+measured the same effect settings over 30 frames after a warm-up frame (median of
+three runs):
 
 | | 720p | 1080p |
 |---|---|---|
-| Through RAM | 43.5 ms | 88.2 ms |
+| Through RAM | 28.1 ms | 48.7 ms |
+
+The earlier CPU conversion path measured 48.6 / 97.8 ms in alternating runs on the
+same machine. RAM transfers still keep this path above the 16.7 ms budget for 60 fps.
 
 ## Testing without Resolume
 

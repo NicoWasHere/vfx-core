@@ -34,13 +34,13 @@ pub const COMPILE_STATUS: GLenum = 0x8B81;
 pub const LINK_STATUS: GLenum = 0x8B82;
 #[cfg(target_os = "macos")]
 pub const TEXTURE_RECTANGLE: GLenum = 0x84F5;
-#[cfg(target_os = "macos")]
-pub const FRAMEBUFFER: GLenum = 0x8D40;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub const DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const COLOR_ATTACHMENT0: GLenum = 0x8CE0;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const VIEWPORT: GLenum = 0x0BA2;
 
 // Keep the signatures in one place; Windows calls use the system GL ABI.
@@ -218,13 +218,13 @@ gl_functions! {
     fn glDeleteVertexArrays(n: GLsizei, arrays: *const GLuint);
     fn glBindVertexArray(array: GLuint);
     fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glGenFramebuffers(n: GLsizei, fbos: *mut GLuint);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glDeleteFramebuffers(n: GLsizei, fbos: *const GLuint);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glBindFramebuffer(target: GLenum, fbo: GLuint);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glFramebufferTexture2D(
         target: GLenum,
         attachment: GLenum,
@@ -232,11 +232,11 @@ gl_functions! {
         texture: GLuint,
         level: GLint,
     );
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glGetIntegerv(name: GLenum, data: *mut GLint);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn glViewport(x: GLint, y: GLint, w: GLsizei, h: GLsizei);
     #[cfg(target_os = "macos")]
     fn glFinish();
@@ -264,7 +264,7 @@ void main() {
 ";
 
 /// An FFGL texture (premultiplied, bottom-up) to a pipeline canvas (straight, top-down).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const TO_CANVAS: &str = "#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
@@ -416,11 +416,26 @@ impl Texture {
         }
     }
 
-    /// Uploads RGBA f32 pixels, rows bottom-up, reallocating if the size changed.
+    /// Allocates storage without uploading pixels, for drawing into the texture.
+    ///
+    /// # Safety
+    /// The context must be current.
+    #[cfg(target_os = "windows")]
+    pub unsafe fn allocate(&mut self, size: (u32, u32)) {
+        // SAFETY: the caller has the context current; null allocates uninitialised storage.
+        unsafe { self.update(size, std::ptr::null()) };
+    }
+
+    /// Uploads RGBA f32 pixels in their supplied row order, reallocating if the size changed.
     ///
     /// # Safety
     /// The context must be current; `pixels` holds `size` RGBA texels.
     pub unsafe fn upload(&mut self, size: (u32, u32), pixels: &[f32]) {
+        // SAFETY: the caller passes a full image with the context current.
+        unsafe { self.update(size, pixels.as_ptr().cast()) };
+    }
+
+    unsafe fn update(&mut self, size: (u32, u32), data: *const c_void) {
         // SAFETY: the caller has the context current and passes a full image.
         unsafe {
             if self.handle == 0 {
@@ -436,30 +451,10 @@ impl Texture {
             glPixelStorei(UNPACK_ALIGNMENT, 1);
             let (w, h) = (size.0 as GLsizei, size.1 as GLsizei);
             if self.size != size {
-                glTexImage2D(
-                    TEXTURE_2D,
-                    0,
-                    RGBA32F,
-                    w,
-                    h,
-                    0,
-                    RGBA,
-                    FLOAT,
-                    pixels.as_ptr().cast(),
-                );
+                glTexImage2D(TEXTURE_2D, 0, RGBA32F, w, h, 0, RGBA, FLOAT, data);
                 self.size = size;
-            } else {
-                glTexSubImage2D(
-                    TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    w,
-                    h,
-                    RGBA,
-                    FLOAT,
-                    pixels.as_ptr().cast(),
-                );
+            } else if !data.is_null() {
+                glTexSubImage2D(TEXTURE_2D, 0, 0, 0, w, h, RGBA, FLOAT, data);
             }
             glPixelStorei(UNPACK_ALIGNMENT, 4);
             glBindTexture(TEXTURE_2D, 0);
@@ -478,38 +473,32 @@ impl Texture {
     }
 }
 
-/// A framebuffer drawing into a rectangle texture, for rendering into an IOSurface.
-#[cfg(target_os = "macos")]
+/// A framebuffer drawing into a texture, for pixel conversion or an IOSurface.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub struct Target {
     fbo: GLuint,
     size: (u32, u32),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Target {
     /// # Safety
-    /// The context must be current and `texture` a rectangle texture of `size`.
-    pub unsafe fn new(texture: GLuint, size: (u32, u32)) -> Result<Self, String> {
-        // SAFETY: the caller has the context current. The host's framebuffer binding is
-        // restored by the caller after drawing, as FFGL requires.
+    /// The context must be current and `texture` a `target` texture of `size`.
+    pub unsafe fn new(texture: GLuint, target: GLenum, size: (u32, u32)) -> Result<Self, String> {
+        // SAFETY: the caller has the context current. Only the draw framebuffer is
+        // changed; a separate host read framebuffer stays bound throughout.
         unsafe {
             let mut previous = 0;
             glGetIntegerv(0x8CA6, &mut previous); // GL_FRAMEBUFFER_BINDING
             let mut fbo = 0;
             glGenFramebuffers(1, &mut fbo);
-            glBindFramebuffer(FRAMEBUFFER, fbo);
-            glFramebufferTexture2D(
-                FRAMEBUFFER,
-                COLOR_ATTACHMENT0,
-                TEXTURE_RECTANGLE,
-                texture,
-                0,
-            );
-            let status = glCheckFramebufferStatus(FRAMEBUFFER);
-            glBindFramebuffer(FRAMEBUFFER, previous as GLuint);
+            glBindFramebuffer(DRAW_FRAMEBUFFER, fbo);
+            glFramebufferTexture2D(DRAW_FRAMEBUFFER, COLOR_ATTACHMENT0, target, texture, 0);
+            let status = glCheckFramebufferStatus(DRAW_FRAMEBUFFER);
+            glBindFramebuffer(DRAW_FRAMEBUFFER, previous as GLuint);
             if status != FRAMEBUFFER_COMPLETE {
                 glDeleteFramebuffers(1, &fbo);
-                return Err(format!("IOSurface framebuffer incomplete (0x{status:x})"));
+                return Err(format!("texture framebuffer incomplete (0x{status:x})"));
             }
             Ok(Self { fbo, size })
         }
@@ -525,10 +514,10 @@ impl Target {
         unsafe {
             let mut viewport = [0; 4];
             glGetIntegerv(VIEWPORT, viewport.as_mut_ptr());
-            glBindFramebuffer(FRAMEBUFFER, self.fbo);
+            glBindFramebuffer(DRAW_FRAMEBUFFER, self.fbo);
             glViewport(0, 0, self.size.0 as GLsizei, self.size.1 as GLsizei);
             draw();
-            glBindFramebuffer(FRAMEBUFFER, host_fbo);
+            glBindFramebuffer(DRAW_FRAMEBUFFER, host_fbo);
             glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
         }
     }

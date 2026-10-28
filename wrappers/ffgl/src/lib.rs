@@ -10,9 +10,12 @@
 //! `VFX_FFGL_PATH=ram` forces the RAM path, for comparing the two.
 
 mod ffi;
+#[cfg(any(not(target_os = "windows"), test))]
 mod frame;
 mod gl;
 mod params;
+#[cfg(target_os = "windows")]
+mod ram;
 #[cfg(target_os = "macos")]
 mod surface;
 
@@ -69,6 +72,8 @@ struct Instance {
     display: [u8; 16],
     blit: Option<gl::Blit>,
     output: gl::Texture,
+    #[cfg(target_os = "windows")]
+    ram: Option<ram::Canvas>,
     #[cfg(target_os = "macos")]
     interop: Option<surface::Interop>,
     #[cfg(target_os = "macos")]
@@ -84,6 +89,8 @@ impl Instance {
             display: [0; 16],
             blit: None,
             output: gl::Texture::new(),
+            #[cfg(target_os = "windows")]
+            ram: None,
             #[cfg(target_os = "macos")]
             interop: None,
             #[cfg(target_os = "macos")]
@@ -233,6 +240,10 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                 let mut instance = unsafe { Box::from_raw(inst) };
                 unsafe {
                     instance.output.delete();
+                    #[cfg(target_os = "windows")]
+                    if let Some(canvas) = instance.ram.take() {
+                        canvas.delete();
+                    }
                     if let Some(blit) = instance.blit.take() {
                         blit.delete();
                     }
@@ -361,9 +372,39 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         }
     }
 
-    // SAFETY: the host's texture is a 2D texture of its hardware size.
-    let texels = unsafe { gl::read_texture(tex.handle, (tex.hardware_width, tex.hardware_height)) };
-    let canvas = frame::texture_to_canvas(&texels, tex.hardware_width, w, h);
+    #[cfg(target_os = "windows")]
+    let canvas = {
+        if me.ram.as_ref().is_none_or(|canvas| canvas.size != (w, h)) {
+            // SAFETY: the context is current; the old canvas belongs to it.
+            if let Some(old) = me.ram.take() {
+                unsafe { old.delete() };
+            }
+            match unsafe { ram::Canvas::new((w, h)) } {
+                Ok(canvas) => me.ram = Some(canvas),
+                Err(e) => {
+                    LOG.note(&format!(
+                        "warning: RAM canvas unavailable, passing frames through: {e}"
+                    ));
+                    return pass_through(blit);
+                }
+            }
+        }
+        // SAFETY: the host's texture has its declared hardware size; the context is current.
+        unsafe {
+            me.ram.as_ref().unwrap().read(
+                tex.handle,
+                (tex.hardware_width, tex.hardware_height),
+                args.host_fbo,
+            )
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let canvas = {
+        // SAFETY: the host's texture is a 2D texture of its hardware size.
+        let texels =
+            unsafe { gl::read_texture(tex.handle, (tex.hardware_width, tex.hardware_height)) };
+        frame::texture_to_canvas(&texels, tex.hardware_width, w, h)
+    };
     let job = pipeline::Job {
         settings: &settings,
         width: w,
@@ -378,10 +419,14 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         LOG.note("warning: GPU render failed, passing frames through");
         return pass_through(blit);
     };
-    let texels = frame::canvas_to_texture(&result, w, h);
+    #[cfg(not(target_os = "windows"))]
+    let result = frame::canvas_to_texture(&result, w, h);
     // SAFETY: the context is current; the texture is the plugin's own.
     unsafe {
-        me.output.upload((w, h), &texels);
+        me.output.upload((w, h), &result);
+        #[cfg(target_os = "windows")]
+        me.ram.as_ref().unwrap().draw(me.output.handle);
+        #[cfg(not(target_os = "windows"))]
         blit.draw(me.output.handle, gl::TEXTURE_2D, [1.0, 1.0]);
     }
     true
