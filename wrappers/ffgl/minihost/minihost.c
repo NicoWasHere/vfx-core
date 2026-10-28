@@ -17,6 +17,9 @@
 #ifndef PLUGIN_NAME
 #define PLUGIN_NAME "VFX Preview" /* run.sh passes the one in plugin.env */
 #endif
+#ifndef PLUGIN_LOG
+#define PLUGIN_LOG "VfxPreview-FFGL.log" /* run.sh passes <PLUGIN_FILE>-FFGL.log */
+#endif
 
 #include <math.h>
 #include <stdint.h>
@@ -546,8 +549,8 @@ static void case_timing(void) {
 static int logged_message(const char *message) {
     char name[MAX_PATH], prefix[64], line[2048];
     DWORD n = GetTempPathA(sizeof name, name);
-    if (!n || n + strlen("VfxFfgl.log") >= sizeof name) return 0;
-    strcat(name, "VfxFfgl.log");
+    if (!n || n + strlen(PLUGIN_LOG) >= sizeof name) return 0;
+    strcat(name, PLUGIN_LOG);
     FILE *log = fopen(name, "r");
     if (!log) return 0;
     snprintf(prefix, sizeof prefix, "[pid %lu] ", GetCurrentProcessId());
