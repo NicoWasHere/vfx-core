@@ -5,6 +5,12 @@ the four-byte ID is `SGCM`, and its file is `SegcamMotionRust.dll` on Windows or
 `SegcamMotionRust.bundle` on macOS. It has its own entry point; it shares only the
 FFGL bindings and GL helpers with VFX Preview.
 
+Build and install with `examples/segcam-motion-ffgl/bundle-win.sh --install` from
+Git Bash, or `examples/segcam-motion-ffgl/bundle-mac.sh --install` on macOS. Without
+`--install`, the result stays in `target/vfx-plugin`. Restart the host after copying
+it into Extra Effects. See [segcam's README](../segcam-motion/README.md#resolume-ffgl)
+for the controls, frame times and remaining host checks.
+
 The host supplies one texture at a time. The plugin keeps the last background frames
 (and the trail in Swarm mode), reusing their ARGB byte buffers. GL crops padded
 textures, flips the rows and unpremultiplies the input before the CPU core sees it;
