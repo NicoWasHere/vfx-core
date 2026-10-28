@@ -287,6 +287,15 @@ static Frame frame(int w, int h, int hw, int hh) {
     return f;
 }
 
+static void check_context(void) {
+#ifdef _WIN32
+    if (wglGetCurrentContext() != ctx || wglGetCurrentDC() != dc) {
+        fprintf(stderr, "plugin changed the host context or device context\n");
+        exit(2);
+    }
+#endif
+}
+
 static int render(void *inst, Frame *f) {
     Texture t = {(uint32_t)f->w, (uint32_t)f->h, (uint32_t)f->hw, (uint32_t)f->hh, f->input};
     Texture *list[1] = {&t};
@@ -296,6 +305,7 @@ static int render(void *inst, Frame *f) {
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
     uint32_t r = call(PROCESS_OPENGL, ptr(&p), inst).u;
+    check_context();
     glReadPixels(0, 0, f->w, f->h, GL_RGBA, GL_FLOAT, f->out);
     for (int i = 0; i < f->w * f->h; i++) {
         float *o = &f->out[i * 4];
@@ -486,6 +496,7 @@ static void case_timing(void) {
             Texture *list[1] = {&tex};
             Process p = {1, list, f.target.fbo};
             CHECK(call(PROCESS_OPENGL, ptr(&p), inst).u == 0, "timed process failed");
+            check_context();
         }
         glFinish();
         double ms = (now() - t0) * 1000 / n;

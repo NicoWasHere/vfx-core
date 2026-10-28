@@ -14,7 +14,12 @@ impl Gpu {
 
     /// Requests a GPU with no window surface. Async, so the caller picks the executor.
     pub async fn headless() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // Plugins run inside hosts that own OpenGL contexts, and wgpu's GL backend would
+        // take over the host's current one.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
