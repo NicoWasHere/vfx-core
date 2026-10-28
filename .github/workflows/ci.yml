@@ -91,6 +91,16 @@ jobs:
         shell: bash
         run: ./wrappers/ofx/bundle-win.sh
 
+      - name: FFGL wrapper tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p vfx-ffgl
+
+      # The Windows FFGL mini host runs locally only; runners have no OpenGL 4.1 GPU.
+      - name: Build Windows FFGL DLL
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./wrappers/ffgl/bundle-win.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: vfx-plugins-${{ runner.os }}
@@ -99,4 +109,5 @@ jobs:
             target/vfx-plugin/VfxAdobe.plugin
             target/vfx-plugin/VfxAdobe.aex
             target/vfx-plugin/VfxPreview.ofx.bundle
+            target/vfx-plugin/VfxPreview.dll
           if-no-files-found: error

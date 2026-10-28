@@ -9,18 +9,173 @@
  *
  *   minihost <plugin binary> [case]   cases: all (default), info, passthrough,
  *                                     brightness, padding, blur, vignette, state, timing
+ * Windows also checks rejection without a current context (case: context).
  * Exit status 0 when every check passes.
  */
 #define GL_SILENCE_DEPRECATION
-#include <OpenGL/OpenGL.h>
-#include <OpenGL/gl3.h>
-#include <dlfcn.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <GL/gl.h>
+
+/* Windows ships GL 1.1 headers. Declare the few newer calls and constants here. */
+#define GL_RGBA32F 0x8814
+#define GL_FRAMEBUFFER 0x8D40
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_CURRENT_PROGRAM 0x8B8D
+#define GL_VERTEX_ARRAY_BINDING 0x85B5
+#define GL_ACTIVE_TEXTURE 0x84E0
+#define GL_TEXTURE0 0x84C0
+#define GL_FRAMEBUFFER_BINDING 0x8CA6
+
+static PROC gl_proc(const char *name) {
+    PROC p = wglGetProcAddress(name);
+    uintptr_t address = (uintptr_t)p;
+    if (!p || address == 1 || address == 2 || address == 3 || address == UINTPTR_MAX)
+        p = (PROC)GetProcAddress(GetModuleHandleA("opengl32.dll"), name);
+    return p;
+}
+typedef void (APIENTRY *glGenTexturesProc)(GLsizei n, GLuint *textures);
+static glGenTexturesProc p_glGenTextures;
+#define glGenTextures p_glGenTextures
+typedef void (APIENTRY *glBindTextureProc)(GLenum target, GLuint texture);
+static glBindTextureProc p_glBindTexture;
+#define glBindTexture p_glBindTexture
+typedef void (APIENTRY *glTexParameteriProc)(GLenum target, GLenum name, GLint value);
+static glTexParameteriProc p_glTexParameteri;
+#define glTexParameteri p_glTexParameteri
+typedef void (APIENTRY *glTexImage2DProc)(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum kind, const void *data);
+static glTexImage2DProc p_glTexImage2D;
+#define glTexImage2D p_glTexImage2D
+typedef void (APIENTRY *glGenFramebuffersProc)(GLsizei n, GLuint *fbos);
+static glGenFramebuffersProc p_glGenFramebuffers;
+#define glGenFramebuffers p_glGenFramebuffers
+typedef void (APIENTRY *glBindFramebufferProc)(GLenum target, GLuint fbo);
+static glBindFramebufferProc p_glBindFramebuffer;
+#define glBindFramebuffer p_glBindFramebuffer
+typedef void (APIENTRY *glFramebufferTexture2DProc)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+static glFramebufferTexture2DProc p_glFramebufferTexture2D;
+#define glFramebufferTexture2D p_glFramebufferTexture2D
+typedef GLenum (APIENTRY *glCheckFramebufferStatusProc)(GLenum target);
+static glCheckFramebufferStatusProc p_glCheckFramebufferStatus;
+#define glCheckFramebufferStatus p_glCheckFramebufferStatus
+typedef void (APIENTRY *glViewportProc)(GLint x, GLint y, GLsizei w, GLsizei h);
+static glViewportProc p_glViewport;
+#define glViewport p_glViewport
+typedef void (APIENTRY *glClearColorProc)(GLfloat r, GLfloat g, GLfloat b, GLfloat a);
+static glClearColorProc p_glClearColor;
+#define glClearColor p_glClearColor
+typedef void (APIENTRY *glClearProc)(GLbitfield mask);
+static glClearProc p_glClear;
+#define glClear p_glClear
+typedef void (APIENTRY *glReadPixelsProc)(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum kind, void *data);
+static glReadPixelsProc p_glReadPixels;
+#define glReadPixels p_glReadPixels
+typedef void (APIENTRY *glGetIntegervProc)(GLenum name, GLint *data);
+static glGetIntegervProc p_glGetIntegerv;
+#define glGetIntegerv p_glGetIntegerv
+typedef GLenum (APIENTRY *glGetErrorProc)(void);
+static glGetErrorProc p_glGetError;
+#define glGetError p_glGetError
+typedef void (APIENTRY *glFinishProc)(void);
+static glFinishProc p_glFinish;
+#define glFinish p_glFinish
+typedef const GLubyte * (APIENTRY *glGetStringProc)(GLenum name);
+static glGetStringProc p_glGetString;
+#define glGetString p_glGetString
+
+static int load_gl(void) {
+    p_glGenTextures = (glGenTexturesProc)gl_proc("glGenTextures");
+    if (!p_glGenTextures) { fprintf(stderr, "missing OpenGL function glGenTextures\n"); return 0; }
+    p_glBindTexture = (glBindTextureProc)gl_proc("glBindTexture");
+    if (!p_glBindTexture) { fprintf(stderr, "missing OpenGL function glBindTexture\n"); return 0; }
+    p_glTexParameteri = (glTexParameteriProc)gl_proc("glTexParameteri");
+    if (!p_glTexParameteri) { fprintf(stderr, "missing OpenGL function glTexParameteri\n"); return 0; }
+    p_glTexImage2D = (glTexImage2DProc)gl_proc("glTexImage2D");
+    if (!p_glTexImage2D) { fprintf(stderr, "missing OpenGL function glTexImage2D\n"); return 0; }
+    p_glGenFramebuffers = (glGenFramebuffersProc)gl_proc("glGenFramebuffers");
+    if (!p_glGenFramebuffers) { fprintf(stderr, "missing OpenGL function glGenFramebuffers\n"); return 0; }
+    p_glBindFramebuffer = (glBindFramebufferProc)gl_proc("glBindFramebuffer");
+    if (!p_glBindFramebuffer) { fprintf(stderr, "missing OpenGL function glBindFramebuffer\n"); return 0; }
+    p_glFramebufferTexture2D = (glFramebufferTexture2DProc)gl_proc("glFramebufferTexture2D");
+    if (!p_glFramebufferTexture2D) { fprintf(stderr, "missing OpenGL function glFramebufferTexture2D\n"); return 0; }
+    p_glCheckFramebufferStatus = (glCheckFramebufferStatusProc)gl_proc("glCheckFramebufferStatus");
+    if (!p_glCheckFramebufferStatus) { fprintf(stderr, "missing OpenGL function glCheckFramebufferStatus\n"); return 0; }
+    p_glViewport = (glViewportProc)gl_proc("glViewport");
+    if (!p_glViewport) { fprintf(stderr, "missing OpenGL function glViewport\n"); return 0; }
+    p_glClearColor = (glClearColorProc)gl_proc("glClearColor");
+    if (!p_glClearColor) { fprintf(stderr, "missing OpenGL function glClearColor\n"); return 0; }
+    p_glClear = (glClearProc)gl_proc("glClear");
+    if (!p_glClear) { fprintf(stderr, "missing OpenGL function glClear\n"); return 0; }
+    p_glReadPixels = (glReadPixelsProc)gl_proc("glReadPixels");
+    if (!p_glReadPixels) { fprintf(stderr, "missing OpenGL function glReadPixels\n"); return 0; }
+    p_glGetIntegerv = (glGetIntegervProc)gl_proc("glGetIntegerv");
+    if (!p_glGetIntegerv) { fprintf(stderr, "missing OpenGL function glGetIntegerv\n"); return 0; }
+    p_glGetError = (glGetErrorProc)gl_proc("glGetError");
+    if (!p_glGetError) { fprintf(stderr, "missing OpenGL function glGetError\n"); return 0; }
+    p_glFinish = (glFinishProc)gl_proc("glFinish");
+    if (!p_glFinish) { fprintf(stderr, "missing OpenGL function glFinish\n"); return 0; }
+    p_glGetString = (glGetStringProc)gl_proc("glGetString");
+    if (!p_glGetString) { fprintf(stderr, "missing OpenGL function glGetString\n"); return 0; }
+    return 1;
+}
+
+static HWND window;
+static HDC dc;
+static HGLRC ctx;
+
+static int create_context(void) {
+    WNDCLASSA wc = {0};
+    wc.style = CS_OWNDC;
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "VfxFfglMinihost";
+    if (!RegisterClassA(&wc)) return 0;
+    /* No WS_VISIBLE: this window only supplies a device context. */
+    window = CreateWindowA(wc.lpszClassName, "FFGL mini host", WS_OVERLAPPEDWINDOW,
+                           0, 0, 16, 16, NULL, NULL, wc.hInstance, NULL);
+    if (!window || !(dc = GetDC(window))) return 0;
+    PIXELFORMATDESCRIPTOR pf = {0};
+    pf.nSize = sizeof pf;
+    pf.nVersion = 1;
+    pf.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pf.iPixelType = PFD_TYPE_RGBA;
+    pf.cColorBits = 32;
+    int format = ChoosePixelFormat(dc, &pf);
+    if (!format || !SetPixelFormat(dc, format, &pf)) return 0;
+    HGLRC bootstrap = wglCreateContext(dc);
+    if (!bootstrap) return 0;
+    if (!wglMakeCurrent(dc, bootstrap)) { wglDeleteContext(bootstrap); return 0; }
+    typedef HGLRC (WINAPI *CreateContext)(HDC, HGLRC, const int *);
+    CreateContext create = (CreateContext)gl_proc("wglCreateContextAttribsARB");
+    /* WGL_CONTEXT_{MAJOR,MINOR}_VERSION_ARB, PROFILE_MASK_ARB, CORE_PROFILE_BIT_ARB. */
+    int attributes[] = {0x2091, 4, 0x2092, 1, 0x9126, 1, 0};
+    if (create) ctx = create(dc, NULL, attributes);
+    wglMakeCurrent(NULL, NULL);
+    wglDeleteContext(bootstrap);
+    if (!ctx || !wglMakeCurrent(dc, ctx)) return 0;
+    return load_gl();
+}
+
+static void *open_plugin(const char *path) { return (void *)LoadLibraryA(path); }
+static void *plugin_symbol(void *lib, const char *name) { return (void *)GetProcAddress((HMODULE)lib, name); }
+static void open_failed(void) { fprintf(stderr, "LoadLibrary failed (error %lu)\n", GetLastError()); }
+#else
+#include <OpenGL/OpenGL.h>
+#include <OpenGL/gl3.h>
+#include <dlfcn.h>
+static void *open_plugin(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static void *plugin_symbol(void *lib, const char *name) { return dlsym(lib, name); }
+static void open_failed(void) { fprintf(stderr, "dlopen: %s\n", dlerror()); }
+#endif
 
 /* The FFGL 2.1 ABI (from Resolume's FFGL.h). */
 typedef union { uint32_t u; void *p; } FFMixed;
@@ -152,7 +307,10 @@ static int render(void *inst, Frame *f) {
 static void *instantiate(int w, int h) {
     Viewport v = {0, 0, (GLuint)w, (GLuint)h};
     FFMixed r = call(INSTANTIATE_GL, ptr(&v), NULL);
-    CHECK(r.p && (uintptr_t)r.p != FF_FAIL, "instantiate failed");
+    if (!r.p || (uintptr_t)r.p == FF_FAIL) {
+        fprintf(stderr, "instantiate failed (see VfxFfgl.log)\n");
+        exit(2);
+    }
     double t = 0;
     call(SET_TIME, ptr(&t), r.p);
     return r.p;
@@ -168,6 +326,19 @@ static float max_diff(Frame *f) {
 }
 
 /* ---- Cases ------------------------------------------------------------------------- */
+
+#ifdef _WIN32
+static void case_context(void) {
+    CHECK(wglMakeCurrent(NULL, NULL), "detach context");
+    PluginInfo *info = call(GET_INFO, u(0), NULL).p;
+    CHECK(info && info->major == 2, "metadata needs no GL context");
+    Viewport v = {0, 0, 64, 48};
+    CHECK(call(INSTANTIATE_GL, ptr(&v), NULL).u == FF_FAIL, "instantiate without a context should fail");
+    if (!wglMakeCurrent(dc, ctx)) { fprintf(stderr, "restore context failed\n"); exit(2); }
+    void *inst = instantiate(64, 48);
+    CHECK(call(DEINSTANTIATE_GL, u(0), inst).u == 0, "delete instance after restoring context");
+}
+#endif
 
 static void case_info(void) {
     PluginInfo *info = call(GET_INFO, u(0), NULL).p;
@@ -260,10 +431,10 @@ static void case_vignette(void) {
     Frame f = frame(64, 48, 64, 48);
     render(inst, &f);
     /* Brightness relative to the input: near the centre ~1, the far corner darker. */
-    float near = px(f.out, 64, 16, 12)[1] / fmaxf(px(f.straight, 64, 16, 12)[1], 1e-3f);
-    float far = px(f.out, 64, 63, 47)[1] / fmaxf(px(f.straight, 64, 63, 47)[1], 1e-3f);
-    CHECK(near > 0.95f, "vignette centre darkened (%g)", near);
-    CHECK(far < 0.6f, "far corner not darkened (%g)", far);
+    float near_brightness = px(f.out, 64, 16, 12)[1] / fmaxf(px(f.straight, 64, 16, 12)[1], 1e-3f);
+    float far_brightness = px(f.out, 64, 63, 47)[1] / fmaxf(px(f.straight, 64, 63, 47)[1], 1e-3f);
+    CHECK(near_brightness > 0.95f, "vignette centre darkened (%g)", near_brightness);
+    CHECK(far_brightness < 0.6f, "far corner not darkened (%g)", far_brightness);
     call(DEINSTANTIATE_GL, u(0), inst);
 }
 
@@ -284,7 +455,18 @@ static void case_state(void) {
     call(DEINSTANTIATE_GL, u(0), inst);
 }
 
-static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static double now(void) {
+#ifdef _WIN32
+    LARGE_INTEGER t, frequency;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&frequency);
+    return (double)t.QuadPart / frequency.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+#endif
+}
 
 static void case_timing(void) {
     int sizes[][2] = {{1280, 720}, {1920, 1080}};
@@ -303,7 +485,7 @@ static void case_timing(void) {
             Texture tex = {(uint32_t)w, (uint32_t)h, (uint32_t)w, (uint32_t)h, f.input};
             Texture *list[1] = {&tex};
             Process p = {1, list, f.target.fbo};
-            call(PROCESS_OPENGL, ptr(&p), inst);
+            CHECK(call(PROCESS_OPENGL, ptr(&p), inst).u == 0, "timed process failed");
         }
         glFinish();
         double ms = (now() - t0) * 1000 / n;
@@ -314,6 +496,9 @@ static void case_timing(void) {
 
 typedef struct { const char *name; void (*run)(void); } Case;
 static Case cases[] = {
+#ifdef _WIN32
+    {"context", case_context},
+#endif
     {"info", case_info}, {"passthrough", case_passthrough}, {"brightness", case_brightness},
     {"padding", case_padding}, {"blur", case_blur}, {"vignette", case_vignette},
     {"state", case_state}, {"timing", case_timing},
@@ -321,6 +506,9 @@ static Case cases[] = {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: minihost <plugin binary> [case]\n"); return 2; }
+#ifdef _WIN32
+    if (!create_context()) { fprintf(stderr, "no OpenGL 4.1 core context (error %lu)\n", GetLastError()); return 2; }
+#else
     /* Prefer the GPU. Virtual machines (CI runners) have no accelerated OpenGL, so fall
        back to Apple's software renderer; the plugin then takes its RAM path. */
     CGLPixelFormatAttribute accelerated[] = {
@@ -343,11 +531,12 @@ int main(int argc, char **argv) {
     }
     if (CGLCreateContext(pf, NULL, &ctx)) { fprintf(stderr, "CGLCreateContext failed\n"); return 2; }
     CGLSetCurrentContext(ctx);
+#endif
     printf("GL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
 
-    void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (!lib) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 2; }
-    plug = (PlugMain)dlsym(lib, "plugMain");
+    void *lib = open_plugin(argv[1]);
+    if (!lib) { open_failed(); return 2; }
+    plug = (PlugMain)plugin_symbol(lib, "plugMain");
     if (!plug) { fprintf(stderr, "no plugMain export\n"); return 2; }
     if (call(INITIALISE_V2, u(0), NULL).u != 0) { fprintf(stderr, "initialise failed\n"); return 2; }
 
@@ -363,5 +552,11 @@ int main(int argc, char **argv) {
     call(DEINITIALISE, u(0), NULL);
     if (!ran) { fprintf(stderr, "unknown case %s\n", only); return 2; }
     printf("%d case(s), %d failure(s)\n", ran, failures);
+#ifdef _WIN32
+    wglMakeCurrent(NULL, NULL);
+    wglDeleteContext(ctx);
+    ReleaseDC(window, dc);
+    DestroyWindow(window);
+#endif
     return failures ? 1 : 0;
 }
