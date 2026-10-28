@@ -12,3 +12,7 @@ crate-type = ["cdylib", "rlib"]
 vfx-core = { path = "../.." }
 vfx-wrapper-common = { path = "../common" }
 pollster = "1.0.1"
+
+[features]
+default = ["plugin"]
+plugin = []

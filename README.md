@@ -9,10 +9,11 @@ for several hosts:
 | After Effects | `wrappers/adobe` | After Effects 2026 (Premiere untested) | tested in AE; SmartFX, 8/16/32 bpc, Multi-Frame Rendering, GPU-native on Metal |
 | OpenFX | `wrappers/ofx` | DaVinci Resolve, Nuke, Natron… | passes a mini host on macOS and Windows; loads in Resolve 21 on macOS (the Mac App Store build hides third-party OpenFX); renders in Natron 2.5 on Windows |
 | FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17 on macOS; GPU sharing via IOSurface on macOS and Vulkan on Windows; both Windows paths pass the mini host |
+| segcam OpenFX | `examples/segcam-motion-ofx` | Resolve, Nuke, Natron | CPU temporal motion segmentation; checked against its CLI and in Natron 2.5 on Windows |
 | Preview app | `examples/preview` | desktop and browser (WebGPU) | egui control panel; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
 | segcam Motion | `examples/segcam-motion` | After Effects | a separate effect, ported from segcam's C++ one: motion segmentation, mattes and the swarm collage on the CPU; renders byte-identical frames to the C++ |
 
-Every target except segcam Motion renders the same effect chain through the same code, so
+Every target except the segcam Motion plugins renders the same effect chain through the same code, so
 a frame looks the same in each host. segcam Motion is a second, unrelated effect, built here
 as an example.
 
@@ -54,6 +55,7 @@ examples/preview/       standalone app: egui panel, native and web
   web/                  index.html and build.sh for the WebGPU build
 examples/segcam-motion/ segcam's motion effect for After Effects, ported from C++ (own README)
   ae-tests/             renders it in After Effects beside the C++ effect and compares
+examples/segcam-motion-ofx/ OpenFX adapter and temporal DLL/CLI checks
 .github/workflows/      ci.yml (tests, plugin builds), pages.yml (web preview)
 ```
 
