@@ -10,9 +10,11 @@ for several hosts:
 | OpenFX | `wrappers/ofx` | DaVinci Resolve, Nuke, Natron… | passes a mini host on macOS and Windows; loads in Resolve 21 on macOS (the Mac App Store build hides third-party OpenFX); renders in Natron 2.5 on Windows |
 | FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17 on macOS; GPU sharing via IOSurface on macOS and Vulkan on Windows; both Windows paths pass the mini host |
 | Preview app | `examples/preview` | desktop and browser (WebGPU) | egui control panel; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
+| segcam Motion | `examples/segcam-motion` | After Effects | a separate effect, ported from segcam's C++ one: motion segmentation, mattes and the swarm collage on the CPU; renders byte-identical frames to the C++ |
 
-Every target renders the same effect chain through the same code, so a frame looks the
-same in each host.
+Every target except segcam Motion renders the same effect chain through the same code, so
+a frame looks the same in each host. segcam Motion is a second, unrelated effect, built here
+as an example.
 
 Licensed MIT OR Apache-2.0.
 
@@ -50,6 +52,8 @@ wrappers/
     minihost/           a small FFGL host in C with a headless OpenGL context
 examples/preview/       standalone app: egui panel, native and web
   web/                  index.html and build.sh for the WebGPU build
+examples/segcam-motion/ segcam's motion effect for After Effects, ported from C++ (own README)
+  ae-tests/             renders it in After Effects beside the C++ effect and compares
 .github/workflows/      ci.yml (tests, plugin builds), pages.yml (web preview)
 ```
 

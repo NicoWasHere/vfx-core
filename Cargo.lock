@@ -2394,6 +2394,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "segcam-motion"
+version = "1.0.0"
+dependencies = [
+ "after-effects",
+ "pipl",
+]
+
+[[package]]
 name = "self_cell"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
