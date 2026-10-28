@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use segcam_motion::{Argb, FrameSource, OutputMode, RenderSettings, View, ViewMut};
+use segcam_motion::{Argb, Channel, FrameSource, OutputMode, RenderSettings, View, ViewMut};
 
 const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames > argb-frames
   --mode overlay|matte|boxmatte|swarm   (overlay)
@@ -25,17 +25,19 @@ const USAGE: &str = "usage: segcam-motion WIDTH HEIGHT [options] < argb-frames >
   --max-segments n                      (16)
   --grid columns                        (192)
   --trail frames  --max-tiles n         (24, 100)
-  --mirror  --no-boxes  --no-labels";
+  --mirror  --no-boxes  --no-labels
+  --float                              (render in float, still raw 8-bit I/O)
+  --straight-alpha                     (input and output use straight alpha)";
 
 /// The last few frames, oldest first: ffmpeg's argb is `Argb<u8>` byte for byte.
-struct Ring {
-    frames: VecDeque<Vec<Argb<u8>>>,
+struct Ring<C> {
+    frames: VecDeque<Vec<Argb<C>>>,
     width: i32,
     height: i32,
 }
 
-impl FrameSource<u8> for Ring {
-    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<View<'_, u8>>)) {
+impl<C: Channel> FrameSource<C> for Ring<C> {
+    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<View<'_, C>>)) {
         f(self
             .frames
             .get(index)
@@ -68,6 +70,7 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
             "--grid" => s.grid_width = value()?.parse().ok()?,
             "--trail" => s.trail_frames = value()?.parse().ok()?,
             "--max-tiles" => s.max_tiles = value()?.parse().ok()?,
+            "--straight-alpha" => s.straight_alpha = true,
             "--mirror" => s.mirror = true,
             "--no-boxes" => s.boxes = false,
             "--no-labels" => s.labels = false,
@@ -78,12 +81,22 @@ fn parse(args: &[String]) -> Option<(i32, i32, RenderSettings)> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let float = args.iter().any(|a| a == "--float");
+    args.retain(|a| a != "--float");
     let Some((width, height, settings)) = parse(&args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
 
+    if float {
+        run::<f32>(width, height, settings)
+    } else {
+        run::<u8>(width, height, settings)
+    }
+}
+
+fn run<C: Channel>(width: i32, height: i32, settings: RenderSettings) -> ExitCode {
     let pixels = width as usize * height as usize;
     let keep = segcam_motion::previous_frames_needed(&settings) as usize + 1;
     let mut ring = Ring {
@@ -91,7 +104,7 @@ fn main() -> ExitCode {
         width,
         height,
     };
-    let mut out = vec![Argb::<u8>::default(); pixels];
+    let mut out = vec![Argb::<C>::default(); pixels];
     let (mut stdin, mut stdout) = (io::stdin().lock(), io::stdout().lock());
     let mut bytes = vec![0u8; pixels * 4];
     let mut frame = 0i64;
@@ -102,10 +115,10 @@ fn main() -> ExitCode {
             .0
             .iter()
             .map(|&[alpha, red, green, blue]| Argb {
-                alpha,
-                red,
-                green,
-                blue,
+                alpha: C::from_unit(f32::from(alpha) / 255.0),
+                red: C::from_unit(f32::from(red) / 255.0),
+                green: C::from_unit(f32::from(green) / 255.0),
+                blue: C::from_unit(f32::from(blue) / 255.0),
             })
             .collect();
         ring.frames.push_back(argb);
@@ -119,7 +132,8 @@ fn main() -> ExitCode {
         segcam_motion::render(&settings, &mut ring, count, frame, &mut view);
 
         for (dst, p) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&out) {
-            *dst = [p.alpha, p.red, p.green, p.blue];
+            *dst = [p.alpha, p.red, p.green, p.blue]
+                .map(|c| (c.to_unit().clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
         }
         if stdout.write_all(&bytes).is_err() {
             return ExitCode::FAILURE;

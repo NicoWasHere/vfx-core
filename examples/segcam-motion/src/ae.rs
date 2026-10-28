@@ -78,7 +78,7 @@ impl AdobePluginGlobal for Global {
         slider(
             params,
             Params::Background,
-            "Background frames",
+            "Background",
             [1, 120, 1, 60],
             d.background_frames,
         )?;
@@ -124,7 +124,7 @@ impl AdobePluginGlobal for Global {
         slider(
             params,
             Params::Trail,
-            "Swarm trail frames",
+            "Trail frames",
             [1, 120, 1, 60],
             d.trail_frames,
         )?;
