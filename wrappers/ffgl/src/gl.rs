@@ -1,5 +1,5 @@
 //! The few OpenGL calls the plugin makes, in the host's GL 4.1 core context. Linked
-//! from macOS's OpenGL framework, which exports core-profile functions directly.
+//! from macOS's OpenGL framework, or loaded from the current context on Windows.
 //!
 //! Everything here runs on the host's GL thread with its context current, and leaves
 //! the state FFGL hosts expect: no program, vertex array or texture bound, and texture
@@ -32,14 +32,140 @@ pub const VERTEX_SHADER: GLenum = 0x8B31;
 pub const FRAGMENT_SHADER: GLenum = 0x8B30;
 pub const COMPILE_STATUS: GLenum = 0x8B81;
 pub const LINK_STATUS: GLenum = 0x8B82;
+#[cfg(target_os = "macos")]
 pub const TEXTURE_RECTANGLE: GLenum = 0x84F5;
+#[cfg(target_os = "macos")]
 pub const FRAMEBUFFER: GLenum = 0x8D40;
+#[cfg(target_os = "macos")]
 pub const COLOR_ATTACHMENT0: GLenum = 0x8CE0;
+#[cfg(target_os = "macos")]
 pub const FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
+#[cfg(target_os = "macos")]
 pub const VIEWPORT: GLenum = 0x0BA2;
 
-#[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
-unsafe extern "C" {
+// Keep the signatures in one place; Windows calls use the system GL ABI.
+macro_rules! gl_functions {
+    ($( $(#[$attr:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
+        #[cfg(not(target_os = "windows"))]
+        #[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
+        unsafe extern "C" {
+            $( $(#[$attr])* fn $name($($arg: $ty),*) $(-> $ret)?; )*
+        }
+
+        #[cfg(target_os = "windows")]
+        #[allow(non_snake_case, clippy::too_many_arguments)]
+        mod windows {
+            use super::*;
+            use std::ffi::CStr;
+            use std::sync::OnceLock;
+
+            #[link(name = "opengl32")]
+            unsafe extern "system" {
+                fn wglGetProcAddress(name: *const c_char) -> *const c_void;
+                fn wglGetCurrentContext() -> *mut c_void;
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+                fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *const c_void;
+            }
+
+            struct Functions {
+                $( $(#[$attr])* $name: unsafe extern "system" fn($($ty),*) $(-> $ret)?, )*
+            }
+            static FUNCTIONS: OnceLock<Result<Functions, String>> = OnceLock::new();
+
+            fn valid_address(address: *const c_void) -> bool {
+                !matches!(address as usize, 0 | 1 | 2 | 3 | usize::MAX)
+            }
+
+            impl Functions {
+                // SAFETY: the resolver must return each named GL function's address
+                // in the current context, or a null/sentinel address when unavailable.
+                unsafe fn load_with(mut resolve: impl FnMut(&CStr) -> *const c_void) -> Result<Self, String> {
+                    Ok(Self {
+                        $( $(#[$attr])* $name: {
+                            let name = concat!(stringify!($name), "\0");
+                            let name = CStr::from_bytes_with_nul(name.as_bytes()).unwrap();
+                            let address = resolve(name);
+                            if !valid_address(address) {
+                                return Err(format!("missing OpenGL function {}", name.to_string_lossy()));
+                            }
+                            // SAFETY: the resolver supplies this symbol's declared GL ABI.
+                            unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(address) }
+                        }, )*
+                    })
+                }
+            }
+
+            /// Loads the table once, with the host's GL context current.
+            pub fn load() -> Result<(), String> {
+                // SAFETY: these queries don't need a context or dereference host data.
+                unsafe {
+                    if wglGetCurrentContext().is_null() {
+                        return Err("no current OpenGL context".into());
+                    }
+                    FUNCTIONS.get_or_init(|| {
+                        let module = GetModuleHandleA(c"opengl32.dll".as_ptr());
+                        Functions::load_with(|name| {
+                            let address = wglGetProcAddress(name.as_ptr());
+                            if valid_address(address) {
+                                address
+                            } else if !module.is_null() {
+                                GetProcAddress(module, name.as_ptr())
+                            } else {
+                                std::ptr::null()
+                            }
+                        })
+                    }).as_ref().map(|_| ()).map_err(Clone::clone)
+                }
+            }
+
+            $( $(#[$attr])*
+                pub(super) unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                    let functions = FUNCTIONS.get().and_then(|f| f.as_ref().ok())
+                        .expect("OpenGL functions loaded before instance creation");
+                    // SAFETY: the caller has the context current and passes GL arguments.
+                    unsafe { (functions.$name)($($arg),*) }
+                }
+            )*
+
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+
+                #[test]
+                fn rejects_wgl_failure_addresses() {
+                    for address in [0, 1, 2, 3, usize::MAX] {
+                        assert!(!valid_address(address as *const c_void));
+                    }
+                    assert!(valid_address(4usize as *const c_void));
+                }
+
+                #[test]
+                fn missing_function_names_the_symbol() {
+                    for address in [0, 1, 2, 3, usize::MAX] {
+                        // SAFETY: a failure address is rejected before any function is stored.
+                        let result = unsafe { Functions::load_with(|_| address as *const c_void) };
+                        assert_eq!(result.err().as_deref(), Some("missing OpenGL function glGenTextures"));
+                    }
+                }
+
+                #[test]
+                fn loading_without_a_context_fails_before_caching() {
+                    assert_eq!(load(), Err("no current OpenGL context".into()));
+                    assert!(FUNCTIONS.get().is_none());
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        use windows::*;
+        #[cfg(target_os = "windows")]
+        pub use windows::load;
+    };
+}
+
+gl_functions! {
     fn glGenTextures(n: GLsizei, textures: *mut GLuint);
     fn glDeleteTextures(n: GLsizei, textures: *const GLuint);
     fn glBindTexture(target: GLenum, texture: GLuint);
@@ -92,9 +218,13 @@ unsafe extern "C" {
     fn glDeleteVertexArrays(n: GLsizei, arrays: *const GLuint);
     fn glBindVertexArray(array: GLuint);
     fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei);
+    #[cfg(target_os = "macos")]
     fn glGenFramebuffers(n: GLsizei, fbos: *mut GLuint);
+    #[cfg(target_os = "macos")]
     fn glDeleteFramebuffers(n: GLsizei, fbos: *const GLuint);
+    #[cfg(target_os = "macos")]
     fn glBindFramebuffer(target: GLenum, fbo: GLuint);
+    #[cfg(target_os = "macos")]
     fn glFramebufferTexture2D(
         target: GLenum,
         attachment: GLenum,
@@ -102,9 +232,13 @@ unsafe extern "C" {
         texture: GLuint,
         level: GLint,
     );
+    #[cfg(target_os = "macos")]
     fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
+    #[cfg(target_os = "macos")]
     fn glGetIntegerv(name: GLenum, data: *mut GLint);
+    #[cfg(target_os = "macos")]
     fn glViewport(x: GLint, y: GLint, w: GLsizei, h: GLsizei);
+    #[cfg(target_os = "macos")]
     fn glFinish();
 }
 
@@ -130,6 +264,7 @@ void main() {
 ";
 
 /// An FFGL texture (premultiplied, bottom-up) to a pipeline canvas (straight, top-down).
+#[cfg(target_os = "macos")]
 pub const TO_CANVAS: &str = "#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
@@ -142,6 +277,7 @@ void main() {
 ";
 
 /// A pipeline canvas in a rectangle texture back to a premultiplied, bottom-up image.
+#[cfg(target_os = "macos")]
 pub const FROM_CANVAS: &str = "#version 410 core
 uniform sampler2DRect image;
 uniform vec2 max_uv;
@@ -343,11 +479,13 @@ impl Texture {
 }
 
 /// A framebuffer drawing into a rectangle texture, for rendering into an IOSurface.
+#[cfg(target_os = "macos")]
 pub struct Target {
     fbo: GLuint,
     size: (u32, u32),
 }
 
+#[cfg(target_os = "macos")]
 impl Target {
     /// # Safety
     /// The context must be current and `texture` a rectangle texture of `size`.
@@ -407,6 +545,7 @@ impl Target {
 ///
 /// # Safety
 /// The context must be current.
+#[cfg(target_os = "macos")]
 pub unsafe fn finish() {
     // SAFETY: the caller has the context current.
     unsafe { glFinish() };
@@ -416,6 +555,7 @@ pub unsafe fn finish() {
 ///
 /// # Safety
 /// The context must be current.
+#[cfg(target_os = "macos")]
 pub unsafe fn gen_texture() -> GLuint {
     let mut t = 0;
     // SAFETY: the caller has the context current.
@@ -425,6 +565,7 @@ pub unsafe fn gen_texture() -> GLuint {
 
 /// # Safety
 /// The context the texture was made in must be current.
+#[cfg(target_os = "macos")]
 pub unsafe fn delete_texture(texture: GLuint) {
     // SAFETY: the caller has the context current.
     unsafe { glDeleteTextures(1, &texture) };
@@ -434,6 +575,7 @@ pub unsafe fn delete_texture(texture: GLuint) {
 ///
 /// # Safety
 /// The context must be current and `texture` a rectangle texture.
+#[cfg(target_os = "macos")]
 pub unsafe fn nearest_rectangle(texture: GLuint) {
     // SAFETY: the caller has the context current.
     unsafe {
@@ -450,6 +592,7 @@ pub unsafe fn nearest_rectangle(texture: GLuint) {
 ///
 /// # Safety
 /// The context must be current.
+#[cfg(target_os = "macos")]
 pub unsafe fn bind_rectangle(texture: GLuint) {
     // SAFETY: the caller has the context current.
     unsafe { glBindTexture(TEXTURE_RECTANGLE, texture) };
