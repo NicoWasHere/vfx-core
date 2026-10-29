@@ -6,9 +6,9 @@
 //! The filter context has one input; the general context adds an optional "Layer"
 //! clip for the Blend stage.
 
-mod ffi;
-mod host;
-mod image;
+pub mod ffi;
+pub mod host;
+pub mod image;
 mod params;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -52,12 +52,14 @@ static PLUGIN: OfxPlugin = OfxPlugin {
     mainEntry: main_entry,
 };
 
-#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+#[cfg_attr(feature = "plugin", unsafe(no_mangle))]
 pub extern "C" fn OfxGetNumberOfPlugins() -> c_int {
     1
 }
 
-#[unsafe(no_mangle)]
+#[allow(non_snake_case)]
+#[cfg_attr(feature = "plugin", unsafe(no_mangle))]
 pub extern "C" fn OfxGetPlugin(nth: c_int) -> *const OfxPlugin {
     if nth == 0 { &PLUGIN } else { ptr::null() }
 }

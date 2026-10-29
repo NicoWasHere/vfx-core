@@ -10,13 +10,7 @@
 //!
 //! `VFX_FFGL_PATH=ram` forces the RAM path, for comparing the two.
 
-mod ffi;
-#[cfg(any(not(target_os = "windows"), test))]
-mod frame;
-mod gl;
 mod params;
-#[cfg(target_os = "windows")]
-mod ram;
 #[cfg(target_os = "windows")]
 mod shared;
 #[cfg(target_os = "macos")]
@@ -28,6 +22,12 @@ use std::sync::OnceLock;
 
 use vfx_core::Gpu;
 use vfx_wrapper_common::{diag, pipeline};
+
+#[cfg(not(target_os = "windows"))]
+use vfx_ffgl_common::frame;
+#[cfg(target_os = "windows")]
+use vfx_ffgl_common::ram;
+use vfx_ffgl_common::{ffi, gl};
 
 use ffi::*;
 use params::PARAMS;

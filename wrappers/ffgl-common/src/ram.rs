@@ -1,8 +1,8 @@
-//! Windows RAM transfers: GL converts the host's pixels before readback and after upload.
+//! RAM transfers: GL converts the host's pixels before readback and after upload.
 
 use crate::gl;
 
-pub(crate) const FROM_CANVAS: &str = "#version 410 core
+pub const FROM_CANVAS: &str = "#version 410 core
 uniform sampler2D image;
 uniform vec2 max_uv;
 in vec2 uv;
@@ -66,6 +66,23 @@ impl Canvas {
         hardware: (u32, u32),
         host_fbo: gl::GLuint,
     ) -> Vec<f32> {
+        let mut pixels = vec![0.0; self.size.0 as usize * self.size.1 as usize * 4];
+        // SAFETY: the caller supplies the texture and current context.
+        unsafe { self.read_into(texture, hardware, host_fbo, &mut pixels) };
+        pixels
+    }
+
+    /// Reads a straight, top-down image into reusable RGBA float storage.
+    ///
+    /// # Safety
+    /// The context must be current; `texture` has `hardware` texels containing `size`.
+    pub unsafe fn read_into(
+        &self,
+        texture: gl::GLuint,
+        hardware: (u32, u32),
+        host_fbo: gl::GLuint,
+        pixels: &mut [f32],
+    ) {
         let max_uv = [
             self.size.0 as f32 / hardware.0.max(1) as f32,
             self.size.1 as f32 / hardware.1.max(1) as f32,
@@ -75,7 +92,7 @@ impl Canvas {
             self.target.draw_into(host_fbo, || {
                 self.to_canvas.draw(texture, gl::TEXTURE_2D, max_uv);
             });
-            gl::read_texture(self.input.handle, self.size)
+            gl::read_texture_into(self.input.handle, self.size, pixels)
         }
     }
 

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Builds the OpenFX plugin as a Windows (x64) bundle:
+#   target/vfx-plugin/<PLUGIN_FILE>.ofx.bundle   (segcam Motion identity)
+# Usage: ./bundle-win.sh [debug|release] [--install]   (default: release)
+# --install copies it into C:\Program Files\Common Files\OFX\Plugins, where DaVinci
+# Resolve, Nuke, Natron and other OpenFX hosts on Windows look for plugins. Writing there
+# needs a Git Bash started as administrator.
+set -euo pipefail
+
+profile="release"
+install=0
+for arg in "$@"; do
+  case "$arg" in
+    debug|release) profile="$arg" ;;
+    --install) install=1 ;;
+    *) echo "unknown argument $arg" >&2; exit 2 ;;
+  esac
+done
+here="$(cd "$(dirname "$0")" && pwd)"
+target="$here/../../target"
+# The example's own names and ID.
+PLUGIN_FILE=SegcamMotionRust
+PLUGIN_ID=com.lofiscifi.SegcamMotionRust
+PLUGIN_NAME="segcam Motion (Rust)"
+flag=""
+[ "$profile" = "release" ] && flag="--release"
+
+cargo build --manifest-path "$here/Cargo.toml" $flag
+
+# Same layout as on macOS, with the DLL renamed .ofx under Contents/Win64.
+bundle="$target/vfx-plugin/$PLUGIN_FILE.ofx.bundle"
+rm -rf "$bundle"
+mkdir -p "$bundle/Contents/Win64"
+cp "$target/$profile/segcam_motion_ofx.dll" "$bundle/Contents/Win64/$PLUGIN_FILE.ofx"
+echo "$bundle"
+
+if [ "$install" = 1 ]; then
+  dir="$(cygpath -u "${COMMONPROGRAMFILES:-C:\\Program Files\\Common Files}")/OFX/Plugins"
+  mkdir -p "$dir"
+  rm -rf "$dir/$PLUGIN_FILE.ofx.bundle"
+  cp -r "$bundle" "$dir/"
+  echo "installed in $dir"
+fi

@@ -35,6 +35,12 @@ jobs:
           WGPU_BACKEND: ${{ runner.os == 'Linux' && 'vulkan' || '' }}
         run: cargo test -p vfx-core
 
+      # The segcam Motion example: its core is plain Rust, so it tests on every OS.
+      - name: segcam Motion example (clippy, core checks)
+        run: |
+          cargo clippy -p segcam-motion --no-default-features --all-targets -- -D warnings
+          cargo test -p segcam-motion --no-default-features
+
   # The After Effects / Premiere plugin: a universal .plugin bundle on macOS and an
   # .aex on Windows. Unsigned; signing needs the publisher's certificates.
   adobe-plugin:
@@ -49,9 +55,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          components: clippy
 
       - name: Wrapper tests (pixel conversion, pipeline, Metal interop on macOS)
         run: cargo test -p vfx-adobe --lib
+
+      - name: segcam FFGL tests and clippy
+        run: |
+          cargo test -p segcam-motion-ffgl -p vfx-ffgl-common
+          cargo clippy -p segcam-motion-ffgl -p vfx-ffgl-common -p vfx-ffgl --all-targets -- -D warnings
+
+      - name: segcam FFGL mini host and CLI comparison (macOS)
+        if: runner.os == 'macOS'
+        env:
+          FFGL_MINIHOST_SOFTWARE: 1
+        run: ./examples/segcam-motion-ffgl/minihost/run.sh
 
       # OpenFX and FFGL: unit tests, then each plugin in its minimal host. The OpenFX
       # host needs the OpenFX headers (from the official repository); the FFGL host
@@ -66,16 +84,21 @@ jobs:
 
       - name: Build macOS bundle and installer
         if: runner.os == 'macOS'
-        run: ./wrappers/adobe/package-mac.sh
+        run: |
+          ./wrappers/adobe/package-mac.sh
+          ./examples/segcam-motion/package-mac.sh
+          ./wrappers/ffgl/bundle-mac.sh
+          ./examples/segcam-motion-ffgl/bundle-mac.sh
 
       - name: Build Windows .aex
         if: runner.os == 'Windows'
         shell: bash
         run: |
           . ./plugin.env
-          cargo build -p vfx-adobe --release
+          cargo build -p vfx-adobe -p segcam-motion --release
           mkdir -p target/vfx-plugin
           cp target/release/vfx_adobe.dll "target/vfx-plugin/$PLUGIN_FILE.aex"
+          cp target/release/segcam_motion.dll target/vfx-plugin/SegcamMotionRust.aex
 
       # OpenFX on Windows: the same unit tests and mini host as on macOS, the host built
       # with the runner's clang, then the bundle for Resolve and other OpenFX hosts.
@@ -86,6 +109,18 @@ jobs:
           cargo test -p vfx-wrapper-common -p vfx-ofx
           git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
           CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" ./wrappers/ofx/minihost/run.sh
+
+      - name: segcam Motion OpenFX tests and bundle
+        shell: bash
+        run: |
+          cargo test -p segcam-motion-ofx --no-default-features
+          cargo clippy -p segcam-motion-ofx -p segcam-motion -p vfx-ofx --no-default-features --all-targets -- -D warnings
+          CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" bash examples/segcam-motion-ofx/tests/run.sh
+          if [ "$RUNNER_OS" = Windows ]; then
+            bash examples/segcam-motion-ofx/bundle-win.sh
+          else
+            bash examples/segcam-motion-ofx/bundle-mac.sh
+          fi
 
       - name: Build Windows OpenFX bundle
         if: runner.os == 'Windows'
@@ -100,7 +135,9 @@ jobs:
       - name: Build Windows FFGL DLL
         if: runner.os == 'Windows'
         shell: bash
-        run: ./wrappers/ffgl/bundle-win.sh
+        run: |
+          ./wrappers/ffgl/bundle-win.sh
+          ./examples/segcam-motion-ffgl/bundle-win.sh
 
       - uses: actions/upload-artifact@v4
         with:
@@ -111,4 +148,5 @@ jobs:
             target/vfx-plugin/*.aex
             target/vfx-plugin/*.ofx.bundle
             target/vfx-plugin/*.dll
+            target/vfx-plugin/*.bundle
           if-no-files-found: error

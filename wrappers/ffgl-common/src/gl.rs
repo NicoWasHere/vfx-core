@@ -19,6 +19,8 @@ pub const TEXTURE0: GLenum = 0x84C0;
 pub const RGBA: GLenum = 0x1908;
 pub const RGBA32F: GLint = 0x8814;
 pub const FLOAT: GLenum = 0x1406;
+pub const UNSIGNED_BYTE: GLenum = 0x1401;
+pub const RGBA8: GLint = 0x8058;
 pub const TEXTURE_MIN_FILTER: GLenum = 0x2801;
 pub const TEXTURE_MAG_FILTER: GLenum = 0x2800;
 pub const TEXTURE_WRAP_S: GLenum = 0x2802;
@@ -64,7 +66,9 @@ macro_rules! interop_functions {
                 })
             }
         }
-        $(pub(crate) unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+        $(/// # Safety
+          /// The context must be current; arguments must obey the named GL extension.
+          pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
             let functions = FUNCTIONS.get().unwrap().as_ref().unwrap().interop.as_ref().unwrap();
             // SAFETY: interop loading succeeded; the caller supplies GL arguments.
             unsafe { (functions.$name)($($arg),*) }
@@ -308,7 +312,7 @@ gl_functions! {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{
+pub use windows::{
     glCreateMemoryObjectsEXT, glDeleteMemoryObjectsEXT, glDeleteSemaphoresEXT, glGenSemaphoresEXT,
     glGetUnsignedBytevEXT, glImportMemoryWin32HandleEXT, glImportSemaphoreWin32HandleEXT,
     glMemoryObjectParameterivEXT, glSignalSemaphoreEXT, glTexStorageMem2DEXT, glWaitSemaphoreEXT,
@@ -316,6 +320,8 @@ pub(crate) use windows::{
 
 /// Checks the optional sharing functions without making them a requirement for RAM.
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
     use std::ffi::CStr;
     let mut count = 0;
@@ -343,6 +349,8 @@ pub unsafe fn shared_memory_luid() -> Result<[u8; 8], String> {
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn check_error(operation: &str) -> Result<(), String> {
     // SAFETY: the caller has a current context.
     let error = unsafe { glGetError() };
@@ -354,18 +362,24 @@ pub unsafe fn check_error(operation: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn finish_shared() {
     // SAFETY: the caller has a current context.
     unsafe { glFinish() };
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn bind_2d(texture: GLuint) {
     // SAFETY: the caller has a current context and a texture for this target.
     unsafe { glBindTexture(TEXTURE_2D, texture) };
 }
 
 #[cfg(target_os = "windows")]
+/// # Safety
+/// The host GL context must be current and any texture must belong to it.
 pub unsafe fn nearest_2d(texture: GLuint) {
     // SAFETY: the caller has a current context and owns the texture.
     unsafe {
@@ -527,6 +541,17 @@ unsafe fn compile(kind: GLenum, source: &str) -> Result<GLuint, String> {
 pub unsafe fn read_texture(texture: GLuint, size: (u32, u32)) -> Vec<f32> {
     let mut pixels = vec![0.0f32; size.0 as usize * size.1 as usize * 4];
     // SAFETY: the buffer holds the whole level-0 image in RGBA f32.
+    unsafe { read_texture_into(texture, size, &mut pixels) };
+    pixels
+}
+
+/// Reads a texture into reusable RGBA float storage.
+///
+/// # Safety
+/// The context must be current and `texture` must contain `size` texels.
+pub unsafe fn read_texture_into(texture: GLuint, size: (u32, u32), pixels: &mut [f32]) {
+    assert_eq!(pixels.len(), size.0 as usize * size.1 as usize * 4);
+    // SAFETY: the checked slice holds the whole level-0 image in RGBA f32.
     unsafe {
         glBindTexture(TEXTURE_2D, texture);
         glPixelStorei(PACK_ALIGNMENT, 1);
@@ -534,13 +559,40 @@ pub unsafe fn read_texture(texture: GLuint, size: (u32, u32)) -> Vec<f32> {
         glPixelStorei(PACK_ALIGNMENT, 4);
         glBindTexture(TEXTURE_2D, 0);
     }
-    pixels
 }
 
-/// An RGBA32F texture the plugin owns, resized on demand.
+/// Reads a texture into reusable RGBA byte storage.
+///
+/// # Safety
+/// The context must be current and `texture` must contain `size` texels.
+pub unsafe fn read_texture_bytes_into(texture: GLuint, size: (u32, u32), pixels: &mut [u8]) {
+    assert_eq!(pixels.len(), size.0 as usize * size.1 as usize * 4);
+    // SAFETY: the checked slice holds the whole level-0 image in RGBA bytes.
+    unsafe {
+        glBindTexture(TEXTURE_2D, texture);
+        glPixelStorei(PACK_ALIGNMENT, 1);
+        glGetTexImage(
+            TEXTURE_2D,
+            0,
+            RGBA,
+            UNSIGNED_BYTE,
+            pixels.as_mut_ptr().cast(),
+        );
+        glPixelStorei(PACK_ALIGNMENT, 4);
+        glBindTexture(TEXTURE_2D, 0);
+    }
+}
+
+/// A texture the plugin owns, resized on demand; each instance keeps one pixel format.
 pub struct Texture {
     pub handle: GLuint,
     size: (u32, u32),
+}
+
+impl Default for Texture {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Texture {
@@ -555,7 +607,7 @@ impl Texture {
     ///
     /// # Safety
     /// The context must be current.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub unsafe fn allocate(&mut self, size: (u32, u32)) {
         // SAFETY: the caller has the context current; null allocates uninitialised storage.
         unsafe { self.update(size, std::ptr::null()) };
@@ -570,7 +622,37 @@ impl Texture {
         unsafe { self.update(size, pixels.as_ptr().cast()) };
     }
 
+    /// Allocates an RGBA8 target for an 8-bit CPU effect.
+    ///
+    /// # Safety
+    /// The context must be current; this texture must only be used for byte transfers.
+    pub unsafe fn allocate_bytes(&mut self, size: (u32, u32)) {
+        // SAFETY: null allocates storage without reading pixels.
+        unsafe { self.update_format(size, RGBA8, UNSIGNED_BYTE, std::ptr::null()) };
+    }
+
+    /// Uploads RGBA bytes without converting them to float storage on the CPU.
+    ///
+    /// # Safety
+    /// The context must be current; this texture must only be used for byte transfers.
+    pub unsafe fn upload_bytes(&mut self, size: (u32, u32), pixels: &[u8]) {
+        assert_eq!(pixels.len(), size.0 as usize * size.1 as usize * 4);
+        // SAFETY: the checked slice holds the whole image.
+        unsafe { self.update_format(size, RGBA8, UNSIGNED_BYTE, pixels.as_ptr().cast()) };
+    }
+
     unsafe fn update(&mut self, size: (u32, u32), data: *const c_void) {
+        // SAFETY: the caller supplies a full float image or null with the context current.
+        unsafe { self.update_format(size, RGBA32F, FLOAT, data) };
+    }
+
+    unsafe fn update_format(
+        &mut self,
+        size: (u32, u32),
+        internal: GLint,
+        kind: GLenum,
+        data: *const c_void,
+    ) {
         // SAFETY: the caller has the context current and passes a full image.
         unsafe {
             if self.handle == 0 {
@@ -586,10 +668,10 @@ impl Texture {
             glPixelStorei(UNPACK_ALIGNMENT, 1);
             let (w, h) = (size.0 as GLsizei, size.1 as GLsizei);
             if self.size != size {
-                glTexImage2D(TEXTURE_2D, 0, RGBA32F, w, h, 0, RGBA, FLOAT, data);
+                glTexImage2D(TEXTURE_2D, 0, internal, w, h, 0, RGBA, kind, data);
                 self.size = size;
             } else if !data.is_null() {
-                glTexSubImage2D(TEXTURE_2D, 0, 0, 0, w, h, RGBA, FLOAT, data);
+                glTexSubImage2D(TEXTURE_2D, 0, 0, 0, w, h, RGBA, kind, data);
             }
             glPixelStorei(UNPACK_ALIGNMENT, 4);
             glBindTexture(TEXTURE_2D, 0);

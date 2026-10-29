@@ -9,10 +9,14 @@ for several hosts:
 | After Effects | `wrappers/adobe` | After Effects 2026 (Premiere untested) | tested in AE; SmartFX, 8/16/32 bpc, Multi-Frame Rendering, GPU-native on Metal |
 | OpenFX | `wrappers/ofx` | DaVinci Resolve, Nuke, Natron… | passes a mini host on macOS and Windows; loads in Resolve 21 on macOS (the Mac App Store build hides third-party OpenFX); renders in Natron 2.5 on Windows |
 | FFGL | `wrappers/ffgl` | Resolume Avenue / Arena | tested in Avenue 7.17 on macOS; GPU sharing via IOSurface on macOS and Vulkan on Windows; both Windows paths pass the mini host |
+| segcam OpenFX | `examples/segcam-motion-ofx` | Resolve, Nuke, Natron | CPU temporal motion segmentation; checked against its CLI and in Natron 2.5 on Windows |
 | Preview app | `examples/preview` | desktop and browser (WebGPU) | egui control panel; the web build deploys to [GitHub Pages](https://jamecoyne.github.io/vfx-core/) |
+| segcam Motion | `examples/segcam-motion` | After Effects | a separate effect, ported from segcam's C++ one: motion segmentation, mattes and the swarm collage on the CPU; renders byte-identical frames to the C++ |
+| segcam Motion (FFGL) | `examples/segcam-motion-ffgl` | Resolume Avenue / Arena | CPU effect with its own frame history; matches the CLI in the mini host; tested in Avenue 7.28.1 on Windows; macOS host testing pending |
 
-Every target renders the same effect chain through the same code, so a frame looks the
-same in each host.
+Every target except the segcam Motion plugins renders the same effect chain through the same code, so
+a frame looks the same in each host. segcam Motion is a second, unrelated effect, built here
+as an example.
 
 Licensed MIT OR Apache-2.0.
 
@@ -48,8 +52,14 @@ wrappers/
     minihost/           a small OpenFX host in C for testing without an application
   ffgl/                 FFGL 2.1 plugin for Resolume, OpenGL + IOSurface / Vulkan interop
     minihost/           a small FFGL host in C with a headless OpenGL context
+  ffgl-common/          FFGL bindings, GL transfers and pixel repacking, with no plugin entry point
 examples/preview/       standalone app: egui panel, native and web
   web/                  index.html and build.sh for the WebGPU build
+examples/segcam-motion/ segcam's motion effect for After Effects, ported from C++ (own README)
+  ae-tests/             renders it in After Effects beside the C++ effect and compares
+examples/segcam-motion-ofx/ OpenFX adapter and temporal DLL/CLI checks
+examples/segcam-motion-ffgl/  the same motion core for Resolume, with a bounded frame history
+  minihost/             CLI comparison using the shared FFGL host
 .github/workflows/      ci.yml (tests, plugin builds), pages.yml (web preview)
 ```
 
@@ -73,6 +83,8 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin wasm32-unknown-unknow
 | OpenFX (Windows) | `wrappers/ofx/bundle-win.sh --install` | `VfxPreview.ofx.bundle` → `C:\Program Files\Common Files\OFX\Plugins` (run from Git Bash as administrator) |
 | Resolume | `wrappers/ffgl/bundle-mac.sh --install` | copies `VfxPreview.bundle` into `~/Documents/Resolume Avenue/Extra Effects` |
 | Resolume (Windows) | `wrappers/ffgl/bundle-win.sh --install` | copies `VfxPreview.dll` into the existing Resolume Documents folders (run from Git Bash) |
+| segcam Motion (Resolume) | `examples/segcam-motion-ffgl/bundle-mac.sh --install` | universal `SegcamMotionRust.bundle` for Extra Effects |
+| segcam Motion (Resolume, Windows) | `examples/segcam-motion-ffgl/bundle-win.sh --install` | `SegcamMotionRust.dll` for Extra Effects (run from Git Bash) |
 | Windows installer | `wrappers/package-win.sh` | `target/vfx-plugin/VfxPreview-<version>-Windows-Setup.exe` and a `.zip` of the same files (needs [Inno Setup](https://jrsoftware.org/isinfo.php)) |
 
 The `.pkg` scripts sign and notarize only when `SIGN_IDENTITY`, `NOTARY_PROFILE` and
@@ -85,9 +97,9 @@ File names here use the default `PLUGIN_FILE`, `VfxPreview`; see the next sectio
 
 ## Your own plugin
 
-vfx-core is meant to be forked. A plugin's names and IDs live in one file,
-`plugin.env` at the repository root, and every wrapper, build script, installer and
-workflow reads them from there:
+vfx-core is meant to be forked. VFX Preview's names and IDs live in one file,
+`plugin.env` at the repository root, and its wrappers, build scripts, installers and
+workflows read them from there. The separate segcam examples keep their own identity:
 
 | Key | Used for |
 |---|---|
@@ -154,6 +166,8 @@ those, each host has its own harness:
   `FFGL_MINIHOST_SOFTWARE=1` uses Apple's software renderer, as on macOS CI runners.
   Runs in CI on macOS. On Windows, run from Git Bash with `CC` set; the GPU host runs
   locally, while CI runs unit tests and builds the DLL.
+  `examples/segcam-motion-ffgl/minihost/run.sh` uses the same host for segcam, compares
+  960 frames against its CLI and times each CPU mode. It runs on macOS CI as well.
 
 ## Design notes
 
@@ -170,7 +184,7 @@ those, each host has its own harness:
   avoid any CPU copy; everything else (and any setup failure) goes through RAM, and a GPU
   failure passes the frame through unchanged rather than failing the host's render.
 - **Hand-written host bindings.** OpenFX and FFGL are small C ABIs, transcribed from
-  their headers (BSD-licensed; FFGL's notice is kept in `wrappers/ffgl/src/ffi.rs`). The
+  their headers (BSD-licensed; FFGL's notice is kept in `wrappers/ffgl-common/src/ffi.rs`). The
   `ffgl-core` crate was avoided because it's GPL-3.0.
 - **Host quirks found by testing**, now handled and covered by tests or the harnesses:
   After Effects needs PiPL spec version 13.25+ for MFR and sequence-data flattening flags
@@ -183,7 +197,7 @@ those, each host has its own harness:
   - After Effects: the `.aex` builds in CI but hasn't been tested in After Effects.
   - OpenFX: passes the mini host and renders in Natron 2.5, but hasn't been tried in
     Resolve on Windows yet.
-  - FFGL: GPU sharing and RAM both pass the mini host on an RX 5700 XT, but have not
+  - FFGL (VFX Preview): GPU sharing and RAM both pass the mini host on an RX 5700 XT, but have not
     been tried in Resolume on Windows or on other drivers.
 - Premiere Pro is untested. Signing and notarization have never been run.
 - OpenFX GPU rendering (Resolve's Metal extension) and an FFGL thumbnail aren't done.

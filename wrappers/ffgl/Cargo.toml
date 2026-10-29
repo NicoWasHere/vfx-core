@@ -9,6 +9,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+vfx-ffgl-common = { path = "../ffgl-common" }
 vfx-core = { path = "../.." }
 vfx-wrapper-common = { path = "../common" }
 pollster = "1.0.1"
