@@ -1,5 +1,20 @@
 # vfx-core
 
+> **Testing branch (`vfx-carp-segcam`), not for merging.** A sandbox for trying segcam
+> live in the preview app. The segcam Motion code is taken as-is from
+> [jamecoyne/vfx-core#7](https://github.com/jamecoyne/vfx-core/pull/7) (branch
+> `feat/ae-smart-render`) and merged in here; what's new is in `examples/preview`:
+>
+> - **segcam live** (`examples/preview/src/segcam_live.rs`): the swarm with its pile kept
+>   between frames. Each frame adds only its new windows, which expire after a lifetime in
+>   frames or past max tiles. Drawn on the GPU, each pixel painted once. Windows show a
+>   snapshot or the live video behind them.
+> - The preview also gets video files, webcam, expressions on parameters, face tracking,
+>   MP4 export and a Flip effect.
+>
+> It's built on the pre-refactor layout, so expect it to go stale. A new version will
+> follow once the core refactor lands.
+
 GPU video effects written once in Rust on [wgpu](https://wgpu.rs), shipped as plugins
 for several hosts:
 
