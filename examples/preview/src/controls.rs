@@ -1,109 +1,73 @@
-//! The control panel: every effect's parameters, with the same defaults and ranges
-//! as the After Effects, OpenFX and FFGL plugins, plus the preview's own input and
-//! feedback controls.
+//! The control panel: the input, which effect is shown, and that effect's parameters,
+//! drawn from its own parameter list. Only one effect runs at a time.
 
 use egui::{Color32, RichText, Ui};
-use vfx_core::effects::{BLEND_MODES, BLUR_DIRECTIONS};
-use vfx_wrapper_common::{Blur, Settings, Vignette};
+use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
 
+use crate::catalog;
 use crate::effects::PATTERNS;
-use crate::modulation::{self, Expressions, Sources, target};
+use crate::modulation::{self, Expressions, Sources, Target};
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Controls {
     pub pattern: usize,
     pub animate: bool,
-    pub linear: bool,
-    pub color_on: bool,
-    pub brightness: f32,
-    pub contrast: f32,
-    pub saturation: f32,
-    pub vignette_on: bool,
-    /// Normalised, origin at the top left.
-    pub vignette_center: [f32; 2],
-    pub vignette_radius: f32,
-    pub vignette_softness: f32,
-    pub vignette_color: [f32; 3],
-    pub vignette_amount: f32,
-    pub blend_on: bool,
-    pub blend_pattern: usize,
-    pub blend_mode: usize,
-    pub blend_amount: f32,
-    pub blur_on: bool,
-    pub blur_radius: f32,
-    pub blur_direction: usize,
-    pub feedback_on: bool,
-    pub feedback_decay: f32,
-    /// Mirror the source before everything else, when above 0.5.
-    pub flip_x: f32,
-    pub flip_y: f32,
     /// The webcam picked in the Input section.
     pub camera: usize,
+    /// The effect shown, an index into the catalog.
+    pub effect: usize,
+    /// Each effect's second layer, for effects that read one: a pattern, or `None` for no
+    /// layer (as a host's layer menu starts).
+    pub layers: Vec<Option<usize>>,
+    /// Every effect's parameters and values, kept while another effect is shown.
+    pub params: Vec<ParamValues>,
+    specs: Vec<Vec<ParamSpec>>,
 }
 
 impl Default for Controls {
     fn default() -> Self {
+        let specs: Vec<Vec<ParamSpec>> = catalog::entries()
+            .iter()
+            .map(|e| (e.make)().params().to_vec())
+            .collect();
         Self {
             pattern: 0,
             animate: true,
-            linear: false,
-            color_on: true,
-            brightness: 0.0,
-            contrast: 1.0,
-            saturation: 1.0,
-            vignette_on: false,
-            vignette_center: [0.5, 0.5],
-            vignette_radius: 0.75,
-            vignette_softness: 0.5,
-            vignette_color: [0.0, 0.0, 0.0],
-            vignette_amount: 1.0,
-            blend_on: false,
-            blend_pattern: 1,
-            blend_mode: 3,
-            blend_amount: 0.5,
-            blur_on: true,
-            blur_radius: 0.0,
-            blur_direction: 0,
-            feedback_on: false,
-            feedback_decay: 0.85,
-            flip_x: 0.0,
-            flip_y: 0.0,
             camera: 0,
+            effect: 0,
+            layers: catalog::entries()
+                .iter()
+                .map(|e| e.layer_by_default.then_some(1))
+                .collect(),
+            params: specs.iter().map(|s| ParamValues::new(s)).collect(),
+            specs,
         }
     }
 }
 
 impl Controls {
-    /// One frame's pipeline settings for a `size` source.
-    pub fn settings(&self, size: (u32, u32)) -> Settings {
-        Settings {
-            linear: self.linear,
-            color: self
-                .color_on
-                .then_some([self.brightness, self.contrast, self.saturation]),
-            vignette: self.vignette_on.then(|| Vignette {
-                center_px: [
-                    self.vignette_center[0] * size.0 as f32,
-                    self.vignette_center[1] * size.1 as f32,
-                ],
-                radius: self.vignette_radius,
-                softness: self.vignette_softness,
-                color: [
-                    self.vignette_color[0],
-                    self.vignette_color[1],
-                    self.vignette_color[2],
-                    1.0,
-                ],
-                amount: self.vignette_amount,
-            }),
-            blend_mode: self.blend_mode as i32,
-            blend_amount: self.blend_amount,
-            blur: (self.blur_on && self.blur_radius > 0.0).then_some(Blur {
-                radius: self.blur_radius,
-                vertical_scale: 1.0,
-                direction: self.blur_direction as i32,
-                grow: false,
-            }),
+    /// The shown effect's values.
+    pub fn values(&self) -> &ParamValues {
+        &self.params[self.effect]
+    }
+
+    /// The pattern the shown effect's second layer shows, if it has one.
+    pub fn layer(&self) -> Option<usize> {
+        self.layers[self.effect]
+    }
+
+    /// The shown effect's first point parameter, which a click on the image sets.
+    pub fn point_param(&self) -> Option<&'static str> {
+        self.specs[self.effect]
+            .iter()
+            .find(|s| matches!(s.kind, ParamKind::Point { .. }))
+            .map(|s| s.name)
+    }
+
+    /// Sets the shown effect's point parameter to `p` (normalised, top-left origin).
+    pub fn place_point(&mut self, p: [f32; 2]) {
+        if let Some(name) = self.point_param() {
+            let _ = self.params[self.effect].set(name, ParamValue::Point(p));
         }
     }
 }
@@ -112,6 +76,8 @@ impl Controls {
 #[derive(Default)]
 pub struct Actions {
     pub clear_image: bool,
+    /// Another effect was picked.
+    pub effect_changed: bool,
     /// The video's sound was switched on or off.
     pub sound: Option<bool>,
     pub start_export: bool,
@@ -152,6 +118,8 @@ pub struct Status<'a> {
     pub face_tracking: bool,
     /// Set for video files.
     pub playback: Option<Playback>,
+    /// How many extra layers the shown effect reads.
+    pub layers: usize,
 }
 
 /// Seconds as m:ss.s.
@@ -188,36 +156,103 @@ fn transport(ui: &mut Ui, playback: &Playback, actions: &mut Actions) {
     }
 }
 
-fn section(ui: &mut Ui, title: &str, on: Option<&mut bool>, body: impl FnOnce(&mut Ui)) {
+fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong())
         .default_open(true)
-        .show(ui, |ui| match on {
-            Some(on) => {
-                ui.checkbox(on, "Enabled");
-                let enabled = *on;
-                ui.add_enabled_ui(enabled, body);
-            }
-            None => body(ui),
-        });
+        .show(ui, body);
 }
 
-fn slider(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, label: &str) {
-    ui.add(
-        egui::Slider::new(value, range)
-            .text(label)
-            .fixed_decimals(2),
-    );
-}
-
-fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) {
+fn choice(ui: &mut Ui, id: &str, value: &mut usize, options: &[&str]) -> bool {
+    let before = *value;
     egui::ComboBox::from_id_salt(id)
-        .width(170.0)
+        .width(200.0)
         .selected_text(options[*value])
         .show_ui(ui, |ui| {
             for (i, option) in options.iter().enumerate() {
                 ui.selectable_value(value, i, *option);
             }
         });
+    *value != before
+}
+
+/// One parameter's control, with expression boxes under the ones expressions can drive.
+fn param(
+    ui: &mut Ui,
+    spec: &ParamSpec,
+    values: &mut ParamValues,
+    exprs: &mut Expressions,
+    effect: usize,
+) {
+    let label = spec.display_label();
+    let Some(value) = values.get(spec.name) else {
+        return;
+    };
+    let mut set = |v| {
+        let _ = values.set(spec.name, v);
+    };
+    match (spec.kind, value) {
+        (ParamKind::Float { min, max, .. }, ParamValue::Float(mut v)) => {
+            if ui
+                .add(
+                    egui::Slider::new(&mut v, min..=max)
+                        .text(label)
+                        .fixed_decimals(2),
+                )
+                .changed()
+            {
+                set(ParamValue::Float(v));
+            }
+            modulation::field(ui, exprs, Target::new(effect, spec.name));
+        }
+        (ParamKind::Int { options, .. }, ParamValue::Int(v)) if !options.is_empty() => {
+            ui.label(label);
+            let mut i = v.clamp(0, options.len() as i32 - 1) as usize;
+            if choice(ui, spec.name, &mut i, options) {
+                set(ParamValue::Int(i as i32));
+            }
+            modulation::field(ui, exprs, Target::new(effect, spec.name));
+        }
+        (ParamKind::Int { min, max, .. }, ParamValue::Int(mut v)) => {
+            if ui
+                .add(egui::Slider::new(&mut v, min..=max).text(label))
+                .changed()
+            {
+                set(ParamValue::Int(v));
+            }
+            modulation::field(ui, exprs, Target::new(effect, spec.name));
+        }
+        (ParamKind::Bool { .. }, ParamValue::Bool(mut v)) => {
+            if ui.checkbox(&mut v, label).changed() {
+                set(ParamValue::Bool(v));
+            }
+        }
+        (ParamKind::Color { .. }, ParamValue::Color(mut c)) => {
+            ui.horizontal(|ui| {
+                if ui.color_edit_button_rgba_unmultiplied(&mut c).changed() {
+                    set(ParamValue::Color(c));
+                }
+                ui.label(label);
+            });
+        }
+        (ParamKind::Point { .. }, ParamValue::Point(mut p)) => {
+            for (axis, name) in ["x", "y"].into_iter().enumerate() {
+                let text = format!("{label} {name}");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut p[axis], 0.0..=1.0)
+                            .text(text)
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    set(ParamValue::Point(p));
+                }
+                modulation::field(ui, exprs, Target::axis(effect, spec.name, axis));
+            }
+            ui.label(RichText::new("Or click the image to place it.").weak());
+        }
+        _ => {}
+    }
 }
 
 /// Draws the control panel and returns what the app should do.
@@ -244,7 +279,14 @@ pub fn panel(
     ui.separator();
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        section(ui, "Input", None, |ui| {
+        section(ui, "Effect", |ui| {
+            let entries = catalog::entries();
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            actions.effect_changed = choice(ui, "effect", &mut c.effect, &names);
+            ui.label(RichText::new(&entries[c.effect].about).weak());
+        });
+
+        section(ui, "Input", |ui| {
             match status.image {
                 Some(name) => {
                     ui.label(format!("Source: {name}"));
@@ -299,65 +341,37 @@ pub fn panel(
                     actions.face_tracking = Some(tracking);
                 }
             }
+            if status.layers > 0 {
+                ui.label("Layer");
+                let options: Vec<&str> = std::iter::once("None").chain(PATTERNS.iter().copied()).collect();
+                let mut i = c.layers[c.effect].map_or(0, |p| p + 1);
+                if choice(ui, "layer_pattern", &mut i, &options) {
+                    c.layers[c.effect] = i.checked_sub(1);
+                }
+            }
             ui.checkbox(&mut c.animate, "Animate");
-            ui.checkbox(&mut c.linear, "Process in linear light");
         });
 
         egui::CollapsingHeader::new(RichText::new("Expressions").strong())
             .default_open(false)
             .show(ui, |ui| modulation::help(ui, sources));
 
-        // Each slider has an expression box under it; a filled-in box overrides it.
-        let mut param = |ui: &mut Ui, value: &mut f32, range, label, target| {
-            slider(ui, value, range, label);
-            modulation::field(ui, exprs, target);
-        };
-
-        section(ui, "Flip", None, |ui| {
-            param(ui, &mut c.flip_x, 0.0..=1.0, "Horizontal", target::FLIP_X);
-            param(ui, &mut c.flip_y, 0.0..=1.0, "Vertical", target::FLIP_Y);
-            ui.label(RichText::new("Flips above 0.5.").weak());
-        });
-
-        section(ui, "Colour", Some(&mut c.color_on), |ui| {
-            param(ui, &mut c.brightness, -1.0..=1.0, "Brightness", target::BRIGHTNESS);
-            param(ui, &mut c.contrast, 0.0..=4.0, "Contrast", target::CONTRAST);
-            param(ui, &mut c.saturation, 0.0..=4.0, "Saturation", target::SATURATION);
-        });
-
-        section(ui, "Vignette", Some(&mut c.vignette_on), |ui| {
-            param(ui, &mut c.vignette_center[0], 0.0..=1.0, "Centre X", target::VIGNETTE_X);
-            param(ui, &mut c.vignette_center[1], 0.0..=1.0, "Centre Y", target::VIGNETTE_Y);
-            ui.label(RichText::new("Or click the image to place it.").weak());
-            param(ui, &mut c.vignette_radius, 0.0..=2.0, "Radius", target::VIGNETTE_RADIUS);
-            param(ui, &mut c.vignette_softness, 0.0..=1.0, "Softness", target::VIGNETTE_SOFTNESS);
-            ui.horizontal(|ui| {
-                ui.color_edit_button_rgb(&mut c.vignette_color);
-                ui.label("Colour");
-            });
-            param(ui, &mut c.vignette_amount, 0.0..=1.0, "Amount", target::VIGNETTE_AMOUNT);
-        });
-
-        section(ui, "Blend", Some(&mut c.blend_on), |ui| {
-            ui.label("Layer");
-            choice(ui, "blend_pattern", &mut c.blend_pattern, PATTERNS);
-            ui.label("Mode");
-            choice(ui, "blend_mode", &mut c.blend_mode, BLEND_MODES);
-            param(ui, &mut c.blend_amount, 0.0..=1.0, "Amount", target::BLEND_AMOUNT);
-        });
-
-        section(ui, "Blur", Some(&mut c.blur_on), |ui| {
-            param(ui, &mut c.blur_radius, 0.0..=64.0, "Radius (px)", target::BLUR_RADIUS);
-            ui.label("Direction");
-            choice(ui, "blur_direction", &mut c.blur_direction, BLUR_DIRECTIONS);
-        });
-
-        section(ui, "Feedback trail", Some(&mut c.feedback_on), |ui| {
-            param(ui, &mut c.feedback_decay, 0.0..=0.99, "Decay", target::FEEDBACK_DECAY);
+        let effect = c.effect;
+        section(ui, &catalog::entries()[effect].name, |ui| {
+            for spec in &c.specs[effect] {
+                param(ui, spec, &mut c.params[effect], exprs, effect);
+            }
+            if c.specs[effect].is_empty() {
+                ui.label(RichText::new("No parameters.").weak());
+            }
+            ui.add_space(4.0);
+            if ui.button("Reset").clicked() {
+                c.params[effect] = ParamValues::new(&c.specs[effect]);
+            }
         });
 
         #[cfg(not(target_arch = "wasm32"))]
-        section(ui, "Render", None, |ui| match status.export {
+        section(ui, "Render", |ui| match status.export {
             Some(progress) => {
                 ui.add(egui::ProgressBar::new(progress).show_percentage());
                 if ui.button("Cancel").clicked() {
@@ -369,7 +383,7 @@ pub fn panel(
                     actions.start_export = true;
                 }
                 ui.label(
-                    RichText::new("Saves every frame with these settings and expressions, plus the original sound, next to the video.")
+                    RichText::new("Saves every frame through this effect with these settings and expressions, plus the original sound, next to the video.")
                         .weak(),
                 );
             }
@@ -377,15 +391,6 @@ pub fn panel(
                 ui.label(RichText::new("Drop a video on the window to render it.").weak());
             }
         });
-
-        ui.add_space(8.0);
-        if ui.button("Reset all").clicked() {
-            let image_keeps = c.pattern;
-            *c = Controls {
-                pattern: image_keeps,
-                ..Controls::default()
-            };
-        }
     });
     actions
 }
@@ -395,22 +400,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_change_nothing() {
-        let s = Controls::default().settings((64, 48));
-        assert!(!s.linear && s.vignette.is_none() && s.blur.is_none());
-        assert_eq!(s.color, Some([0.0, 1.0, 1.0]));
-    }
-
-    #[test]
-    fn vignette_centre_is_in_source_pixels() {
-        let c = Controls {
-            vignette_on: true,
-            vignette_center: [0.25, 0.75],
-            ..Controls::default()
-        };
+    fn every_effect_has_its_own_values() {
+        let mut c = Controls::default();
+        assert_eq!(c.params.len(), catalog::entries().len());
+        c.effect = catalog::find("Vignette").unwrap();
+        assert_eq!(c.point_param(), Some("center"));
+        c.place_point([0.25, 0.75]);
+        assert_eq!(c.values().point("center"), [0.25, 0.75]);
+        c.effect = catalog::find("Colour Adjust").unwrap();
+        assert_eq!(c.point_param(), None);
+        c.place_point([0.0, 0.0]);
+        let vignette = &c.params[catalog::find("Vignette").unwrap()];
         assert_eq!(
-            c.settings((200, 100)).vignette.unwrap().center_px,
-            [50.0, 75.0]
+            vignette.point("center"),
+            [0.25, 0.75],
+            "other effects keep their values"
         );
     }
 }

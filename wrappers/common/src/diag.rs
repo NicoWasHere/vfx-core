@@ -2,7 +2,8 @@
 //! which bit depths, and any fallback. Each distinct note is written once per session,
 //! so the file stays a few lines long.
 //!
-//! macOS: `~/Library/Logs/<name>`. Elsewhere: the temp directory.
+//! The file is `<plugin file><suffix>`, say `VfxPreview-OpenFX.log`: on macOS in
+//! `~/Library/Logs`, elsewhere in the temp directory.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -10,14 +11,15 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub struct Log {
-    name: &'static str,
+    /// After the plugin's file name, say "-OpenFX.log".
+    suffix: &'static str,
     seen: Mutex<Option<HashSet<String>>>,
 }
 
 impl Log {
-    pub const fn new(name: &'static str) -> Self {
+    pub const fn new(suffix: &'static str) -> Self {
         Self {
-            name,
+            suffix,
             seen: Mutex::new(None),
         }
     }
@@ -43,10 +45,12 @@ impl Log {
     }
 
     fn path(&self) -> Option<PathBuf> {
+        let file = crate::plugin::registered().map_or("vfx", |p| p.info.file);
+        let name = format!("{file}{}", self.suffix);
         if cfg!(target_os = "macos") {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs").join(self.name))
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs").join(name))
         } else {
-            Some(std::env::temp_dir().join(self.name))
+            Some(std::env::temp_dir().join(name))
         }
     }
 }

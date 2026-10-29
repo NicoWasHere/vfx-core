@@ -35,14 +35,15 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 AE_APP = "Adobe After Effects 2026"
 AERENDER = Path(f"/Applications/{AE_APP}/aerender")
+
+
 def plugin_env():
-    """The plugin's names and IDs, from plugin.env at the repository root."""
+    """VFX Preview's names and IDs, from effects/vfx-chain's [package.metadata.vfx]."""
+    out = subprocess.check_output(["cargo", "vfx", "env", "-p", "vfx-chain"], cwd=ROOT, text=True)
     values = {}
-    for line in (ROOT / "plugin.env").read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, rest = line.split("=", 1)
-            values[key.strip()] = rest.strip().split('"')[1]
+    for line in out.splitlines():
+        key, rest = line.split("=", 1)
+        values[key] = rest.strip('"')
     return values
 
 
@@ -484,7 +485,7 @@ def main():
     started = time.time()
 
     print("building the reference renderer")
-    subprocess.run(["cargo", "build", "-q", "--release", "-p", "vfx-adobe",
+    subprocess.run(["cargo", "build", "-q", "--release", "-p", "vfx-chain",
                     "--example", "ae_reference"], cwd=ROOT, check=True)
 
     files = {}

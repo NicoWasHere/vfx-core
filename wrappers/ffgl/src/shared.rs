@@ -9,8 +9,8 @@ use ash::vk::Handle;
 use ash::{khr, vk};
 use vfx_core::Gpu;
 use vfx_core::wgpu::{self, hal};
-use vfx_wrapper_common::Settings;
-use vfx_wrapper_common::pipeline::{FRAME_FORMAT, Lease, Spec};
+use vfx_core::{Context, ParamValues};
+use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 use crate::{gl, ram};
 
@@ -637,8 +637,8 @@ impl Interop {
     /// The host's context must be current; texture and framebuffer are host-owned.
     pub unsafe fn render(
         &self,
-        settings: &Settings,
-        time: f64,
+        values: &ParamValues,
+        ctx: Context,
         texture: u32,
         hardware: (u32, u32),
         host_fbo: u32,
@@ -674,11 +674,11 @@ impl Interop {
             gpu,
             self.device.raw.handle().as_raw() as usize,
             &Spec {
-                settings,
+                values,
+                ctx,
                 width: w,
                 height: h,
                 has_layer: false,
-                canvas_origin: [0.0, 0.0],
             },
         );
         let extent = wgpu::Extent3d {
@@ -703,7 +703,7 @@ impl Interop {
             extent,
         );
         gpu.queue.submit([encoder.finish()]);
-        lease.render(gpu, time);
+        lease.render(gpu);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_texture(
             lease.output().texture.as_image_copy(),

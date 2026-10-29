@@ -25,8 +25,6 @@ pub struct Export {
     detector: Option<Detector>,
     /// Face values, held while no face is found, as live tracking does.
     face: modulation::Face,
-    /// Whether the last rendered frame was flipped (x, y), to mirror face values.
-    flipped: [bool; 2],
     pub out: PathBuf,
 }
 
@@ -41,7 +39,6 @@ impl Export {
             encoder: Some(Encoder::create(info, &out)?),
             frame: 0,
             face: modulation::FACE_NONE,
-            flipped: [false; 2],
             out,
         })
     }
@@ -79,17 +76,12 @@ impl Export {
                     None => self.face[0] = 0.0,
                 }
             }
-            let sources = modulation::sources(
-                t,
-                Some((t, self.info.duration)),
-                audio.levels(t),
-                modulation::flip_face(self.face, self.flipped[0], self.flipped[1]),
-            );
-            let controls = exprs.apply(base, &sources, dt);
-            self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
+            let sources =
+                modulation::sources(t, Some((t, self.info.duration)), audio.levels(t), self.face);
+            let values = exprs.apply(base.effect, base.values(), &sources, dt);
             effects.write_source(gpu, &pixels);
             let out = effects
-                .render(gpu, &controls, t, true)
+                .render(gpu, base, &values, t, true)
                 .expect("capture returns the frame");
             self.encoder
                 .as_mut()
@@ -120,7 +112,7 @@ fn output_path(source: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modulation::target;
+    use crate::modulation::Target;
     use std::process::Command;
 
     /// Renders a generated clip with sound through a bass-driven expression. Needs ffmpeg and
@@ -149,7 +141,8 @@ mod tests {
         effects.start_stream(&gpu, "clip".into(), info.size);
         let audio = Audio::load(&clip);
         let mut exprs = Expressions::default();
-        exprs.set(target::BRIGHTNESS, "bass * 2 - 1");
+        let colour = crate::catalog::find("Colour Adjust").unwrap();
+        exprs.set(Target::new(colour, "brightness"), "bass * 2 - 1");
         let mut export = Export::start(&info, true).unwrap();
         while !export
             .step(

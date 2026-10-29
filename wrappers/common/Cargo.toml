@@ -1,13 +1,12 @@
 [package]
-name = "vfx-wrapper-common"
+name = "vfx-host"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
+description = "What every vfx-core host target shares: the registered plugin, the GPU, the render pool and the render-path log."
 
 [dependencies]
 vfx-core = { path = "../.." }
 bytemuck = "1.25.2"
-
-[dev-dependencies]
 pollster = "1.0.1"

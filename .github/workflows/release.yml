@@ -31,8 +31,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      # The package scripts sign when SIGN_IDENTITY and INSTALLER_IDENTITY are set and
-      # notarize when NOTARY_PROFILE is; this puts the certificates in a keychain for them.
+      # `cargo vfx package` signs when SIGN_IDENTITY and INSTALLER_IDENTITY are set and
+      # notarizes when NOTARY_PROFILE is; this puts the certificates in a keychain for it.
       - name: Signing keychain
         if: env.MACOS_CERTIFICATES_P12 != ''
         run: |
@@ -57,17 +57,18 @@ jobs:
             echo "NOTARY_PROFILE=vfx-notary" >> "$GITHUB_ENV"
           fi
 
+      # Every effect crate: an After Effects and an OpenFX installer, and Resolume's bundle.
       - name: Build the installers
         run: |
-          ./wrappers/adobe/package-mac.sh
-          ./wrappers/ofx/package-mac.sh
-          ./wrappers/ffgl/bundle-mac.sh
-          . ./plugin.env
-          name="$PLUGIN_FILE-${VERSION#v}-macOS"
+          cargo vfx package
           mkdir -p dist
-          cp "target/vfx-plugin/$PLUGIN_FILE-adobe.pkg" "dist/$name-AfterEffects.pkg"
-          cp "target/vfx-plugin/$PLUGIN_FILE-ofx.pkg" "dist/$name-OpenFX.pkg"
-          ditto -c -k --keepParent "target/vfx-plugin/$PLUGIN_FILE.bundle" "dist/$name-Resolume.zip"
+          for crate in $(cargo vfx list | awk '{print $1}'); do
+            eval "$(cargo vfx env -p "$crate")"
+            name="$PLUGIN_FILE-${VERSION#v}-macOS"
+            cp "target/vfx-plugin/$PLUGIN_FILE-adobe.pkg" "dist/$name-AfterEffects.pkg"
+            cp "target/vfx-plugin/$PLUGIN_FILE-ofx.pkg" "dist/$name-OpenFX.pkg"
+            ditto -c -k --keepParent "target/vfx-plugin/$PLUGIN_FILE.bundle" "dist/$name-Resolume.zip"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -85,9 +86,12 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
-      - name: Build the plugins, the installer and the zip
+      - name: Build each effect's plugins, installer and zip
         shell: bash
-        run: VERSION="${VERSION#v}" ./wrappers/package-win.sh
+        run: |
+          for crate in $(cargo vfx list | awk '{print $1}'); do
+            EFFECT="$crate" VERSION="${VERSION#v}" ./wrappers/package-win.sh
+          done
 
       - uses: actions/upload-artifact@v4
         with:

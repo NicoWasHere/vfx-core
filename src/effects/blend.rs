@@ -1,32 +1,14 @@
 use crate::shader::{self, Uniform};
-use crate::{Effect, Frame, Gpu, ParamKind, ParamSpec, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
 pub const BLEND_MODES: &[&str] = &["Normal", "Add", "Multiply", "Screen"];
 
 const PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "mode",
-        kind: ParamKind::Int {
-            min: 0,
-            max: 3,
-            default: 0,
-            options: BLEND_MODES,
-        },
-    },
-    ParamSpec {
-        name: "amount",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-        },
-    },
+    ParamSpec::choice("mode", BLEND_MODES, 0),
+    ParamSpec::float("amount", 0.0, 1.0, 1.0),
     // Decode the layer from sRGB first, for chains that run in linear light. The main
     // input has already been converted by an earlier stage; the layer hasn't.
-    ParamSpec {
-        name: "linearize_layer",
-        kind: ParamKind::Bool { default: false },
-    },
+    ParamSpec::toggle("linearize_layer", false),
 ];
 
 // Straight alpha in and out. The blended colour is laid over the base with the layer's
@@ -99,9 +81,9 @@ impl Effect for Blend {
         input: &Frame,
         output: &Frame,
         params: &ParamValues,
-        time: f64,
+        ctx: &Context,
     ) {
-        self.render_layers(gpu, input, &[], output, params, time);
+        self.render_layers(gpu, input, &[], output, params, ctx);
     }
 
     fn render_layers(
@@ -111,7 +93,7 @@ impl Effect for Blend {
         layers: &[&Frame],
         output: &Frame,
         params: &ParamValues,
-        _time: f64,
+        _ctx: &Context,
     ) {
         let built = self.built.as_ref().expect("prepare before render");
         // No layer: blend the input with itself at zero strength, which is a copy.

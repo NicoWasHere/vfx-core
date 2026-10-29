@@ -1,5 +1,5 @@
 use crate::shader::{self, Uniform};
-use crate::{Effect, Frame, Gpu, ParamSpec, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
 // Colour adjustments are correct on straight alpha. Filters that average neighbouring
 // pixels (blur) are correct on premultiplied alpha, otherwise transparent pixels'
@@ -119,7 +119,7 @@ impl Effect for PixelConvert {
         input: &Frame,
         output: &Frame,
         _params: &ParamValues,
-        _time: f64,
+        _ctx: &Context,
     ) {
         let built = self.built.as_ref().expect("prepare before render");
         let bind = shader::bind_group(&gpu.device, &built.layout, &[&input.view], &built.uniform);

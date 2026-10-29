@@ -5,7 +5,9 @@
 
 use egui::{Color32, RichText, Ui};
 
-use crate::controls::Controls;
+use std::collections::HashMap;
+
+use vfx_core::{ParamValue, ParamValues};
 
 /// Variables an expression can read, in the order `Sources` stores them.
 pub const VARIABLES: &[(&str, &str)] = &[
@@ -44,24 +46,6 @@ pub const FACE_NONE: Face = [
     0.0, 0.5, 0.5, 0.0, 0.45, 0.45, 0.55, 0.45, 0.5, 0.5, 0.5, 0.6,
 ];
 
-/// Face values found in the unflipped source, mirrored to match a flipped picture.
-/// A horizontal flip also swaps the eyes, so "left" stays the left one on screen.
-pub fn flip_face(mut face: Face, x: bool, y: bool) -> Face {
-    if x {
-        for i in [1, 4, 6, 8, 10] {
-            face[i] = 1.0 - face[i];
-        }
-        face.swap(4, 6);
-        face.swap(5, 7);
-    }
-    if y {
-        for i in [2, 5, 7, 9, 11] {
-            face[i] = 1.0 - face[i];
-        }
-    }
-    face
-}
-
 /// Builds the variable values. Video and audio read 0 without a video.
 pub fn sources(time: f64, video: Option<(f64, f64)>, audio: [f32; 5], face: Face) -> Sources {
     let (position, duration) = video.unwrap_or((0.0, 1.0));
@@ -74,69 +58,57 @@ pub fn sources(time: f64, video: Option<(f64, f64)>, audio: [f32; 5], face: Face
     values
 }
 
-/// A parameter expressions can drive.
+/// What an expression box drives: one effect's float or integer parameter, or one
+/// coordinate of a point parameter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Target {
-    pub field: fn(&mut Controls) -> &mut f32,
+    /// Index into the catalog.
+    pub effect: usize,
+    pub param: &'static str,
+    /// For points: 0 for x, 1 for y.
+    pub axis: Option<usize>,
 }
 
-/// Indices into TARGETS, for the panel.
-pub mod target {
-    pub const BRIGHTNESS: usize = 0;
-    pub const CONTRAST: usize = 1;
-    pub const SATURATION: usize = 2;
-    pub const VIGNETTE_X: usize = 3;
-    pub const VIGNETTE_Y: usize = 4;
-    pub const VIGNETTE_RADIUS: usize = 5;
-    pub const VIGNETTE_SOFTNESS: usize = 6;
-    pub const VIGNETTE_AMOUNT: usize = 7;
-    pub const BLEND_AMOUNT: usize = 8;
-    pub const BLUR_RADIUS: usize = 9;
-    pub const FEEDBACK_DECAY: usize = 10;
-    pub const FLIP_X: usize = 11;
-    pub const FLIP_Y: usize = 12;
-}
+impl Target {
+    pub fn new(effect: usize, param: &'static str) -> Self {
+        Self {
+            effect,
+            param,
+            axis: None,
+        }
+    }
 
-pub const TARGETS: &[Target] = &[
-    Target {
-        field: |c| &mut c.brightness,
-    },
-    Target {
-        field: |c| &mut c.contrast,
-    },
-    Target {
-        field: |c| &mut c.saturation,
-    },
-    Target {
-        field: |c| &mut c.vignette_center[0],
-    },
-    Target {
-        field: |c| &mut c.vignette_center[1],
-    },
-    Target {
-        field: |c| &mut c.vignette_radius,
-    },
-    Target {
-        field: |c| &mut c.vignette_softness,
-    },
-    Target {
-        field: |c| &mut c.vignette_amount,
-    },
-    Target {
-        field: |c| &mut c.blend_amount,
-    },
-    Target {
-        field: |c| &mut c.blur_radius,
-    },
-    Target {
-        field: |c| &mut c.feedback_decay,
-    },
-    Target {
-        field: |c| &mut c.flip_x,
-    },
-    Target {
-        field: |c| &mut c.flip_y,
-    },
-];
+    pub fn axis(effect: usize, param: &'static str, axis: usize) -> Self {
+        Self {
+            effect,
+            param,
+            axis: Some(axis),
+        }
+    }
+
+    fn read(&self, values: &ParamValues) -> Option<f32> {
+        match (values.get(self.param)?, self.axis) {
+            (ParamValue::Float(v), None) => Some(v),
+            (ParamValue::Int(v), None) => Some(v as f32),
+            (ParamValue::Point(p), Some(axis)) => Some(p[axis]),
+            _ => None,
+        }
+    }
+
+    /// Writes `v`, rounded for integers; the parameter clamps it to its range.
+    fn write(&self, values: &mut ParamValues, v: f32) {
+        let value = match (values.get(self.param), self.axis) {
+            (Some(ParamValue::Float(_)), None) => ParamValue::Float(v),
+            (Some(ParamValue::Int(_)), None) => ParamValue::Int(v.round() as i32),
+            (Some(ParamValue::Point(mut p)), Some(axis)) => {
+                p[axis] = v;
+                ParamValue::Point(p)
+            }
+            _ => return,
+        };
+        let _ = values.set(self.param, value);
+    }
+}
 
 /// One parameter's expression box.
 #[derive(Default)]
@@ -162,60 +134,57 @@ impl Slot {
     }
 }
 
+/// Every expression box, for every effect: switching effects keeps what was typed.
+#[derive(Default)]
 pub struct Expressions {
-    slots: Vec<Slot>,
-}
-
-impl Default for Expressions {
-    fn default() -> Self {
-        Self {
-            slots: TARGETS.iter().map(|_| Slot::default()).collect(),
-        }
-    }
+    slots: HashMap<Target, Slot>,
 }
 
 impl Expressions {
-    /// `base` with every valid expression applied. `dt` is the time since the last
-    /// frame, for `smooth()`.
-    pub fn apply(&mut self, base: &Controls, sources: &Sources, dt: f32) -> Controls {
-        let mut controls = base.clone();
-        for (slot, target) in self.slots.iter_mut().zip(TARGETS) {
-            let Some(expr) = &mut slot.compiled else {
+    /// `base` (effect `effect`'s values) with every valid expression applied. `dt` is the
+    /// time since the last frame, for `smooth()`.
+    pub fn apply(
+        &mut self,
+        effect: usize,
+        base: &ParamValues,
+        sources: &Sources,
+        dt: f32,
+    ) -> ParamValues {
+        let mut values = base.clone();
+        for (target, slot) in self.slots.iter_mut().filter(|(t, _)| t.effect == effect) {
+            let (Some(expr), Some(value)) = (&mut slot.compiled, target.read(&values)) else {
                 continue;
             };
-            let field = (target.field)(&mut controls);
-            let v = expr.eval(&Env {
-                sources,
-                value: *field,
-                dt,
-            });
+            let v = expr.eval(&Env { sources, value, dt });
             // NaN or infinity (say, 1/0) keeps the slider's value.
             slot.last = v.is_finite().then_some(v);
             if let Some(v) = slot.last {
-                *field = v;
+                target.write(&mut values, v);
             }
         }
-        controls
+        values
     }
 
     /// Forgets `smooth()` history, so an export starts from the source values.
     pub fn reset(&mut self) {
-        for expr in self.slots.iter_mut().filter_map(|s| s.compiled.as_mut()) {
+        for expr in self.slots.values_mut().filter_map(|s| s.compiled.as_mut()) {
             expr.reset();
         }
     }
 
     #[cfg(test)]
-    pub fn set(&mut self, target: usize, text: &str) {
-        self.slots[target].text = text.into();
-        self.slots[target].recompile();
+    pub fn set(&mut self, target: Target, text: &str) {
+        let slot = self.slots.entry(target).or_default();
+        slot.text = text.into();
+        slot.recompile();
     }
 }
 
 /// The expression box for `target`, drawn under its slider.
-pub fn field(ui: &mut Ui, exprs: &mut Expressions, target: usize) {
-    let slot = &mut exprs.slots[target];
+pub fn field(ui: &mut Ui, exprs: &mut Expressions, target: Target) {
+    let slot = exprs.slots.entry(target).or_default();
     let edit = egui::TextEdit::singleline(&mut slot.text)
+        .id_salt(target)
         .hint_text("expression, e.g. sin(time/4)")
         .font(egui::TextStyle::Monospace)
         .desired_width(f32::INFINITY);
@@ -710,27 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn flipped_faces_mirror_and_keep_eyes_on_their_side() {
-        // Face at x 0.2, left eye 0.15, right eye 0.25, mouth y 0.7.
-        let mut face = FACE_NONE;
-        face[1] = 0.2;
-        face[4] = 0.15;
-        face[6] = 0.25;
-        face[11] = 0.7;
-        let x = flip_face(face, true, false);
-        assert!((x[1] - 0.8).abs() < 1e-6);
-        // The eye on the left of the flipped picture is the one that was at 0.25.
-        assert!(
-            (x[4] - 0.75).abs() < 1e-6 && (x[6] - 0.85).abs() < 1e-6,
-            "{x:?}"
-        );
-        assert!(x[4] < x[6]);
-        let y = flip_face(face, false, true);
-        assert!((y[11] - 0.3).abs() < 1e-6);
-        assert_eq!(flip_face(face, false, false), face);
-    }
-
-    #[test]
     fn conditions_pick_a_branch() {
         let mut face = FACE_NONE;
         face[3] = 0.1; // facesize
@@ -764,34 +712,74 @@ mod tests {
         }
     }
 
+    fn values(effect: usize) -> ParamValues {
+        ParamValues::new((crate::catalog::entries()[effect].make)().params())
+    }
+
+    /// Expressions and values for the named effect.
+    fn setup(name: &str) -> (usize, ParamValues) {
+        let effect = find(name).expect("in the catalog");
+        (effect, values(effect))
+    }
+
+    use crate::catalog::find;
+
+    const COLOUR: &str = "Colour Adjust";
+    const BLUR: &str = "Gaussian Blur";
+    const VIGNETTE: &str = "Vignette";
+    const SEGCAM: &str = "segcam Motion (Rust)";
+
     #[test]
     fn expressions_override_sliders_and_empty_ones_dont() {
         let mut exprs = Expressions::default();
-        let base = Controls::default();
+        let (colour, base) = setup(COLOUR);
         let s = sources(0.0, None, [0.0, 0.8, 0.0, 0.0, 0.0], FACE_NONE);
-        exprs.set(target::BRIGHTNESS, "bass - 0.3");
-        exprs.set(target::CONTRAST, "  ");
-        let out = exprs.apply(&base, &s, 1.0 / 60.0);
-        assert!((out.brightness - 0.5).abs() < 1e-6);
-        assert_eq!(out.contrast, base.contrast);
-        exprs.set(target::BRIGHTNESS, "1 / 0");
-        assert_eq!(
-            exprs.apply(&base, &s, 1.0 / 60.0).brightness,
-            base.brightness
-        );
+        exprs.set(Target::new(colour, "brightness"), "bass - 0.3");
+        exprs.set(Target::new(colour, "contrast"), "  ");
+        let out = exprs.apply(colour, &base, &s, 1.0 / 60.0);
+        assert!((out.float("brightness") - 0.5).abs() < 1e-6);
+        assert_eq!(out.float("contrast"), base.float("contrast"));
+        exprs.set(Target::new(colour, "brightness"), "1 / 0");
+        let out = exprs.apply(colour, &base, &s, 1.0 / 60.0);
+        assert_eq!(out.float("brightness"), base.float("brightness"));
+        // Another effect's expressions leave this one alone.
+        exprs.set(Target::new(setup(BLUR).0, "radius"), "99");
+        let out = exprs.apply(colour, &base, &s, 1.0 / 60.0);
+        assert_eq!(out.float("contrast"), base.float("contrast"));
+    }
+
+    #[test]
+    fn points_take_an_axis_and_integers_round() {
+        let mut exprs = Expressions::default();
+        let s = sources(0.0, None, [0.0; 5], FACE_NONE);
+        let (vignette, base) = setup(VIGNETTE);
+        exprs.set(Target::axis(vignette, "center", 1), "0.25");
+        let out = exprs.apply(vignette, &base, &s, 1.0 / 60.0);
+        assert_eq!(out.point("center"), [0.5, 0.25]);
+        let (segcam, base) = setup(SEGCAM);
+        exprs.set(Target::new(segcam, "background"), "40.6");
+        exprs.set(Target::new(segcam, "output"), "9");
+        let out = exprs.apply(segcam, &base, &s, 1.0 / 60.0);
+        assert_eq!(out.int("background"), 41);
+        assert_eq!(out.int("output"), 3, "clamped to the last mode");
     }
 
     #[test]
     fn smooth_eases_and_resets() {
         let mut exprs = Expressions::default();
-        let base = Controls::default();
-        exprs.set(target::BLUR_RADIUS, "smooth(bass * 10, 0.9)");
+        let (blur, base) = setup(BLUR);
+        exprs.set(Target::new(blur, "radius"), "smooth(bass * 10, 0.9)");
         let quiet = sources(0.0, None, [0.0; 5], FACE_NONE);
         let loud = sources(0.0, None, [1.0; 5], FACE_NONE);
-        assert_eq!(exprs.apply(&base, &quiet, 1.0 / 60.0).blur_radius, 0.0);
-        let eased = exprs.apply(&base, &loud, 1.0 / 60.0).blur_radius;
+        let mut radius = |s| exprs.apply(blur, &base, s, 1.0 / 60.0).float("radius");
+        assert_eq!(radius(&quiet), 0.0);
+        let eased = radius(&loud);
         assert!(eased > 0.5 && eased < 2.0, "{eased}");
+        drop(radius);
         exprs.reset();
-        assert_eq!(exprs.apply(&base, &loud, 1.0 / 60.0).blur_radius, 10.0);
+        assert_eq!(
+            exprs.apply(blur, &base, &loud, 1.0 / 60.0).float("radius"),
+            10.0
+        );
     }
 }

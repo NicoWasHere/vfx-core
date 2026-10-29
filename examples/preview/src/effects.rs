@@ -1,13 +1,16 @@
-//! Everything on the effects side of the preview, all on the GPU:
-//! a test-pattern generator (or an image someone dropped on the window), the shared
-//! plugin pipeline, a feedback trail after it, and a pass that turns the float result
-//! into an 8-bit texture egui can draw.
+//! Everything on the effects side of the preview: a test-pattern generator (or an image
+//! or video someone dropped on the window), the one effect being shown, and a pass that
+//! turns the float result into an 8-bit texture egui can draw.
 
-use vfx_core::effects::{FeedbackTrail, Flip};
-use vfx_core::{EffectChain, Frame, Gpu, ParamValue, Readback};
-use vfx_wrapper_common::pipeline::{FRAME_FORMAT, HEADLESS_DEVICE, Lease, Spec};
+use vfx_core::effects::PixelConvert;
+use vfx_core::{EffectChain, Frame, Gpu, ParamValues, Processor, Readback};
 
+use crate::catalog;
 use crate::controls::Controls;
+use crate::cpu_stage::CpuStage;
+
+/// Frames are straight-alpha, gamma-encoded RGBA32F, as in the plugins.
+pub const FRAME_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 /// Generated patterns render at this size; dropped images keep their own.
 pub const PATTERN_SIZE: (u32, u32) = (1280, 720);
@@ -194,9 +197,7 @@ struct Frames {
     size: (u32, u32),
     source: Frame,
     layer: Frame,
-    /// The source mirrored, when Flip is on.
-    flipped: Frame,
-    feedback_out: Frame,
+    output: Frame,
     /// Keeps its texture alive.
     display_view: wgpu::TextureView,
 }
@@ -222,9 +223,60 @@ impl Frames {
             size,
             source: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
             layer: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
-            flipped: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
-            feedback_out: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
+            output: Frame::new(gpu, size.0, size.1, FRAME_FORMAT),
             display_view,
+        }
+    }
+}
+
+/// The effect being shown, prepared for the current size: a GPU effect in a chain, with
+/// the alpha conversions around it that its catalog entry asks for, or a CPU effect.
+struct Stage {
+    /// Index into the catalog.
+    effect: usize,
+    /// How many extra layers it reads.
+    layers: usize,
+    run: Run,
+}
+
+enum Run {
+    Gpu {
+        chain: Box<EffectChain>,
+        /// The effect's own position in `chain`.
+        index: usize,
+    },
+    Cpu(Box<CpuStage>),
+}
+
+impl Stage {
+    fn new(gpu: &Gpu, effect: usize, size: (u32, u32)) -> Self {
+        let entry = &catalog::entries()[effect];
+        match (entry.make)() {
+            Processor::Gpu(made) => {
+                let layers = made.layer_inputs();
+                let mut chain = EffectChain::new();
+                if entry.premultiplied {
+                    chain.push(Box::new(PixelConvert::premultiply()));
+                }
+                let index = chain.push(made);
+                if entry.premultiplied {
+                    chain.push(Box::new(PixelConvert::unpremultiply()));
+                }
+                chain.prepare(gpu, FRAME_FORMAT, size);
+                Self {
+                    effect,
+                    layers,
+                    run: Run::Gpu {
+                        chain: Box::new(chain),
+                        index,
+                    },
+                }
+            }
+            Processor::Cpu(made) => Self {
+                effect,
+                layers: 0,
+                run: Run::Cpu(Box::new(CpuStage::new(gpu, made, size))),
+            },
         }
     }
 }
@@ -237,9 +289,7 @@ pub struct Effects {
     readback: Option<Readback>,
     generator: Pass,
     display_pass: Pass,
-    /// Mirrors the source before the shared pipeline.
-    flip: EffectChain,
-    feedback: EffectChain,
+    stage: Stage,
 }
 
 impl Effects {
@@ -264,34 +314,32 @@ impl Effects {
             },
             DISPLAY_FORMAT,
         );
-        let mut effects = Self {
+        Self {
             frames: Frames::new(gpu, PATTERN_SIZE),
             image: None,
             readback: None,
             generator,
             display_pass,
-            flip: EffectChain::new(),
-            feedback: EffectChain::new(),
-        };
-        effects.flip.push(Box::new(Flip::default()));
-        effects.flip.prepare(gpu, FRAME_FORMAT, PATTERN_SIZE);
-        effects.rebuild_feedback(gpu);
-        effects
+            stage: Stage::new(gpu, 0, PATTERN_SIZE),
+        }
     }
 
-    /// Clears the feedback trail's history (also done on every size change).
-    pub fn rebuild_feedback(&mut self, gpu: &Gpu) {
-        self.feedback = EffectChain::new();
-        self.feedback.push(Box::new(FeedbackTrail::default()));
-        self.feedback.prepare(gpu, FRAME_FORMAT, self.frames.size);
+    /// Starts the effect afresh, forgetting anything it carries between frames (a
+    /// feedback trail, segcam's history). Also done on every size or effect change.
+    pub fn reset(&mut self, gpu: &Gpu) {
+        self.stage = Stage::new(gpu, self.stage.effect, self.frames.size);
+    }
+
+    /// How many extra layers the shown effect reads.
+    pub fn layers(&self) -> usize {
+        self.stage.layers
     }
 
     fn set_size(&mut self, gpu: &Gpu, size: (u32, u32)) {
         if self.frames.size != size {
             self.frames = Frames::new(gpu, size);
             self.readback = None;
-            self.flip.prepare(gpu, FRAME_FORMAT, size);
-            self.rebuild_feedback(gpu);
+            self.reset(gpu);
         }
     }
 
@@ -392,98 +440,49 @@ impl Effects {
         self.generator.draw(encoder, &bind, &target.view);
     }
 
-    /// Renders one frame with `controls`. With `capture`, also reads the result back
-    /// (float RGBA, blocking until the GPU is done) for exports.
+    /// Renders one frame of `controls`' effect with `values` (its parameters, after
+    /// expressions). With `capture`, also reads the result back (float RGBA, blocking
+    /// until the GPU is done) for exports.
     pub fn render(
         &mut self,
         gpu: &Gpu,
         controls: &Controls,
+        values: &ParamValues,
         time: f64,
         capture: bool,
     ) -> Option<Vec<f32>> {
-        let (w, h) = self.frames.size;
-        let extent = wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        };
-        let settings = controls.settings(self.frames.size);
-        let spec = Spec {
-            settings: &settings,
-            width: w,
-            height: h,
-            has_layer: controls.blend_on,
-            canvas_origin: [0.0, 0.0],
-        };
-        let mut lease = Lease::new(gpu, HEADLESS_DEVICE, &spec);
-
+        if self.stage.effect != controls.effect {
+            self.stage = Stage::new(gpu, controls.effect, self.frames.size);
+        }
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let source = match &self.image {
             Some((_, frame)) => frame,
             None => {
-                self.generate(
-                    gpu,
-                    &mut encoder,
-                    controls.pattern,
-                    time,
-                    &self.frames.source,
-                );
-                &self.frames.source
+                let target = &self.frames.source;
+                self.generate(gpu, &mut encoder, controls.pattern, time, target);
+                target
             }
         };
-        // Flip first, so clicks on the image and face positions match what's shown.
-        // The flip submits its own pass, so a generated pattern has to land first.
-        let source = if controls.flip_x > 0.5 || controls.flip_y > 0.5 {
-            let generated = std::mem::replace(
-                &mut encoder,
-                gpu.device.create_command_encoder(&Default::default()),
-            );
-            gpu.queue.submit(Some(generated.finish()));
-            let params = self.flip.params_mut(0);
-            params
-                .set("flip_x", ParamValue::Float(controls.flip_x))
-                .expect("flip has flip_x");
-            params
-                .set("flip_y", ParamValue::Float(controls.flip_y))
-                .expect("flip has flip_y");
-            self.flip.render(gpu, source, &self.frames.flipped, time);
-            &self.frames.flipped
-        } else {
-            source
-        };
-        encoder.copy_texture_to_texture(
-            source.texture.as_image_copy(),
-            lease.input().texture.as_image_copy(),
-            extent,
-        );
-        if controls.blend_on {
-            self.generate(
-                gpu,
-                &mut encoder,
-                controls.blend_pattern,
-                time,
-                &self.frames.layer,
-            );
-            encoder.copy_texture_to_texture(
-                self.frames.layer.texture.as_image_copy(),
-                lease.layer().texture.as_image_copy(),
-                extent,
-            );
+        let layer = controls.layer().filter(|_| self.stage.layers > 0);
+        if let Some(pattern) = layer {
+            let target = &self.frames.layer;
+            self.generate(gpu, &mut encoder, pattern, time, target);
         }
         gpu.queue.submit(Some(encoder.finish()));
-        lease.render(gpu, time);
 
-        let result = if controls.feedback_on {
-            self.feedback
-                .params_mut(0)
-                .set("decay", ParamValue::Float(controls.feedback_decay))
-                .expect("feedback has a float decay");
-            self.feedback
-                .render(gpu, lease.output(), &self.frames.feedback_out, time);
-            &self.frames.feedback_out
+        let layers: &[&Frame] = if layer.is_some() {
+            &[&self.frames.layer]
         } else {
-            lease.output()
+            &[]
         };
+        let result = &self.frames.output;
+        match &mut self.stage.run {
+            Run::Gpu { chain, index } => {
+                *chain.params_mut(*index) = values.clone();
+                chain.render_with_layers(gpu, source, layers, result, time);
+            }
+            Run::Cpu(stage) => stage.render(gpu, source, result, values, time),
+        }
 
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -509,20 +508,27 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::find;
+    use vfx_core::ParamValue;
 
-    /// Renders the moving-disc pattern (a left-to-right red gradient underneath) with
-    /// and without a horizontal flip, and checks the result is mirrored.
+    fn shown(name: &str) -> (Controls, ParamValues) {
+        let mut controls = Controls::default();
+        controls.animate = false;
+        controls.effect = find(name).unwrap();
+        let values = controls.values().clone();
+        (controls, values)
+    }
+
+    /// Renders the moving-disc pattern (a left-to-right red gradient underneath) through
+    /// Flip, off and then on, and checks the result is mirrored.
     #[test]
     fn flip_mirrors_the_preview() {
         let gpu = pollster::block_on(Gpu::headless()).unwrap();
         let mut effects = Effects::new(&gpu);
-        let mut controls = Controls {
-            animate: false,
-            ..Controls::default()
-        };
-        let plain = effects.render(&gpu, &controls, 0.0, true).unwrap();
-        controls.flip_x = 1.0;
-        let flipped = effects.render(&gpu, &controls, 0.0, true).unwrap();
+        let (controls, mut values) = shown("Flip");
+        let plain = effects.render(&gpu, &controls, &values, 0.0, true).unwrap();
+        values.set("flip_x", ParamValue::Float(1.0)).unwrap();
+        let flipped = effects.render(&gpu, &controls, &values, 0.0, true).unwrap();
 
         let (w, h) = PATTERN_SIZE;
         let at = |pixels: &[f32], x: u32, y: u32| {
@@ -537,5 +543,40 @@ mod tests {
             at(&plain, 10, 10),
             "pattern is symmetric?"
         );
+    }
+
+    /// Every effect in the catalog renders with its defaults, and switching between them
+    /// works. segcam's first frame is a reference, so it shows the input unchanged.
+    #[test]
+    fn every_effect_renders() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        for (i, entry) in catalog::entries().iter().enumerate() {
+            let mut controls = Controls::default();
+            controls.effect = i;
+            let values = controls.values().clone();
+            let out = effects.render(&gpu, &controls, &values, 0.0, true).unwrap();
+            assert_eq!(out.len(), (PATTERN_SIZE.0 * PATTERN_SIZE.1 * 4) as usize);
+            assert!(out.iter().all(|v| v.is_finite()), "{}", entry.name);
+        }
+    }
+
+    /// segcam through the preview: the disc pattern moves, so after a few frames the
+    /// motion matte is opaque somewhere and clear somewhere else.
+    #[test]
+    fn segcam_finds_the_moving_disc() {
+        let gpu = pollster::block_on(Gpu::headless()).unwrap();
+        let mut effects = Effects::new(&gpu);
+        let (controls, mut values) = shown("segcam Motion (Rust)");
+        values.set("output", ParamValue::Int(1)).unwrap();
+        let mut out = Vec::new();
+        for f in 0..6 {
+            out = effects
+                .render(&gpu, &controls, &values, f64::from(f) * 0.2, true)
+                .unwrap();
+        }
+        let alpha: Vec<f32> = out.iter().skip(3).step_by(4).copied().collect();
+        assert!(alpha.contains(&1.0), "nothing moved");
+        assert!(alpha.contains(&0.0), "everything moved");
     }
 }

@@ -11,8 +11,8 @@ python3 wrappers/adobe/ae-tests/run.py
 
 ## What it needs
 
-- After Effects 2026 with the plugin installed (`wrappers/adobe/package-mac.sh`, then
-  install the `.pkg`). The harness tests whatever build is installed, not the source tree.
+- After Effects 2026 with the plugin installed (`cargo vfx package -p vfx-chain`, then
+  install `target/vfx-plugin/VfxPreview-adobe.pkg`). The harness tests whatever build is installed, not the source tree.
 - `ffmpeg` and `ffprobe` on the `PATH`, and `cargo`.
 - A clean After Effects project, or a moment to answer its save prompt. The harness
   builds its fixtures in the running After Effects and asks before closing your project;
@@ -31,7 +31,7 @@ Narrow it with `--cases blur,hdr` and `--variants 32bpc-gpu`.
 3. Renders each project with `aerender`, so opening a saved project is tested too.
    The 32 bpc GPU project renders twice, with Multi-Frame Rendering on and off.
 4. Runs the plugin's pipeline directly on the same input pixels
-   (`examples/ae_reference.rs`) and compares.
+   (`effects/vfx-chain/examples/ae_reference.rs`) and compares.
 
 | Check | Passes when |
 |---|---|

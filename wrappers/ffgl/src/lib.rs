@@ -1,27 +1,33 @@
-//! FFGL wrapper for vfx-core: the effect for Resolume Avenue and Arena,
-//! and other FFGL 2 hosts.
+//! The FFGL host target: any vfx-core effect as an FFGL 2.1 plugin, for Resolume Avenue and
+//! Arena and other FFGL 2 hosts. An effect crate exports one with `vfx_ffgl::export!(PLUGIN)`
+//! (or `vfx_plugin::export!`, which does every host).
 //!
-//! The host calls `plugMain` on its GL thread with its context current. On macOS each
-//! frame goes GPU to GPU: the host's texture is drawn into an IOSurface that the
-//! plugin's Metal device renders from (see `surface`). Windows shares Vulkan images
-//! with OpenGL (see `shared`). Elsewhere, or if sharing can't be set up, the texture
-//! is read back through RAM, rendered, and uploaded again. If the
-//! GPU path fails, the input is drawn unchanged.
+//! The host calls `plugMain` on its GL thread with its context current.
 //!
-//! `VFX_FFGL_PATH=ram` forces the RAM path, for comparing the two.
+//! GPU effects: on macOS each frame goes GPU to GPU, the host's texture drawn into an
+//! IOSurface that the plugin's Metal device renders from (see `surface`). Windows shares
+//! Vulkan images with OpenGL (see `shared`). Elsewhere, or if sharing can't be set up, the
+//! texture is read back through RAM, rendered, and uploaded again. If the GPU path fails,
+//! the input is drawn unchanged. `VFX_FFGL_PATH=ram` forces the RAM path, for comparing.
+//!
+//! CPU effects: the texture is read back as ARGB bytes into a history of recent frames
+//! (FFGL hands over one frame at a time), rendered on the CPU and uploaded again. Host
+//! time running backwards starts the history over.
 
 mod params;
 #[cfg(target_os = "windows")]
 mod shared;
 #[cfg(target_os = "macos")]
 mod surface;
+mod transfer;
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
-use vfx_core::Gpu;
-use vfx_wrapper_common::{diag, pipeline};
+use vfx_core::cpu::{Argb, History, ImageMut, ViewMut};
+use vfx_core::{Context, CpuEffect, ParamValues, Processor};
+use vfx_host::{Kind, diag, pipeline};
 
 #[cfg(not(target_os = "windows"))]
 use vfx_ffgl_common::frame;
@@ -30,64 +36,116 @@ use vfx_ffgl_common::ram;
 use vfx_ffgl_common::{ffi, gl};
 
 use ffi::*;
-use params::PARAMS;
+use params::Param;
 
-static LOG: diag::Log = diag::Log::new(concat!(env!("VFX_PLUGIN_FILE"), "-FFGL.log"));
+/// For the export macro.
+pub use vfx_host;
 
-static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+static LOG: diag::Log = diag::Log::new("-FFGL.log");
 
-fn gpu() -> Option<&'static Gpu> {
-    GPU.get_or_init(|| match pollster::block_on(Gpu::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            LOG.note(&format!(
-                "warning: no GPU available, passing frames through: {e}"
-            ));
-            None
+/// Exports the plugin a `vfx_host::Plugin` static describes as this binary's FFGL
+/// plugin: `plugMain`, the only FFGL entry point.
+#[macro_export]
+macro_rules! export {
+    ($plugin:path) => {
+        /// The FFGL entry point.
+        ///
+        /// # Safety
+        /// Called by the host with the FFGL ABI.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn plugMain(
+            code: u32,
+            input: $crate::Mixed,
+            instance: *mut ::std::ffi::c_void,
+        ) -> $crate::Mixed {
+            $crate::vfx_host::register(&$plugin);
+            // SAFETY: the host's arguments, passed on as they came.
+            unsafe { $crate::plug_main(code, input, instance) }
         }
-    })
-    .as_ref()
+    };
 }
 
-/// `text` in a fixed FFGL field, zero-padded. build.rs checks that it fits.
-const fn padded<const N: usize>(text: &str) -> [u8; N] {
-    let bytes = text.as_bytes();
-    assert!(bytes.len() <= N, "too long for its FFGL field");
+/// FFGL's value type, for the export macro.
+pub type Mixed = FFMixed;
+
+/// What the host asks about the plugin, made once from the registered plugin.
+struct Statics {
+    info: PluginInfoStruct,
+    extended: PluginExtendedInfoStruct,
+    short_name: CString,
+    _description: CString,
+    _about: CString,
+    table: Vec<Param>,
+}
+
+// SAFETY: the raw pointers point into the CStrings this struct owns, which never change.
+unsafe impl Send for Statics {}
+unsafe impl Sync for Statics {}
+
+/// `text` in a fixed FFGL field, zero-padded and cut to fit.
+fn padded<const N: usize>(text: &str) -> [u8; N] {
     let mut out = [0; N];
-    let mut i = 0;
-    while i < bytes.len() {
-        out[i] = bytes[i];
-        i += 1;
-    }
+    let bytes = &text.as_bytes()[..text.len().min(N)];
+    out[..bytes.len()].copy_from_slice(bytes);
     out
 }
 
-static INFO: PluginInfoStruct = PluginInfoStruct {
-    api_major_version: 2,
-    api_minor_version: 1,
-    plugin_unique_id: padded(env!("VFX_FFGL_ID")),
-    plugin_name: padded(env!("VFX_PLUGIN_NAME")),
-    plugin_type: FF_EFFECT,
-};
+fn statics() -> &'static Statics {
+    static STATICS: OnceLock<Statics> = OnceLock::new();
+    STATICS.get_or_init(|| {
+        let plugin = vfx_host::plugin();
+        let info = &plugin.info;
+        let description = CString::new(info.description).unwrap_or_default();
+        let about = CString::new(format!(
+            "{} {}.{}.{}",
+            info.name, info.version[0], info.version[1], info.version[2]
+        ))
+        .unwrap_or_default();
+        Statics {
+            info: PluginInfoStruct {
+                api_major_version: 2,
+                api_minor_version: 1,
+                plugin_unique_id: padded(info.ffgl_code),
+                plugin_name: padded(info.short_name),
+                plugin_type: FF_EFFECT,
+            },
+            extended: PluginExtendedInfoStruct {
+                plugin_major_version: info.version[0],
+                plugin_minor_version: info.version[1],
+                description: description.as_ptr(),
+                about: about.as_ptr(),
+                free_frame_extended_data_size: 0,
+                free_frame_extended_data_block: std::ptr::null_mut(),
+            },
+            short_name: CString::new(info.short_name).unwrap_or_default(),
+            _description: description,
+            _about: about,
+            table: params::table(plugin.params()),
+        }
+    })
+}
 
-static EXTENDED_INFO: PluginExtendedInfoStruct = PluginExtendedInfoStruct {
-    plugin_major_version: 1,
-    plugin_minor_version: 0,
-    description: c"vfx-core effect chain: colour adjust, vignette and Gaussian blur on the GPU."
-        .as_ptr(),
-    about: c"vfx-core (MIT OR Apache-2.0)".as_ptr(),
-    free_frame_extended_data_size: 0,
-    free_frame_extended_data_block: std::ptr::null_mut(),
-};
+fn table() -> &'static [Param] {
+    &statics().table
+}
+
+/// A CPU effect's state: its frames so far and its last render.
+struct Cpu {
+    effect: Box<dyn CpuEffect>,
+    ram: Option<transfer::Canvas>,
+    history: History<u8>,
+    rendered: Vec<Argb<u8>>,
+}
 
 struct Instance {
     values: Vec<f32>,
     /// Seconds, from FF_SET_TIME.
-    time: f64,
+    time: Option<f64>,
     /// Backing store for FF_GET_PARAMETER_DISPLAY, which returns a pointer.
     display: [u8; 16],
     blit: Option<gl::Blit>,
     output: gl::Texture,
+    cpu: Option<Cpu>,
     #[cfg(target_os = "windows")]
     ram: Option<ram::Canvas>,
     #[cfg(target_os = "macos")]
@@ -101,12 +159,22 @@ struct Instance {
 
 impl Instance {
     fn new() -> Self {
+        let cpu = match (vfx_host::plugin().make)() {
+            Processor::Cpu(effect) => Some(Cpu {
+                effect,
+                ram: None,
+                history: History::default(),
+                rendered: Vec::new(),
+            }),
+            Processor::Gpu(_) => None,
+        };
         Self {
-            values: params::defaults(),
-            time: 0.0,
+            values: table().iter().map(|p| p.default).collect(),
+            time: None,
             display: [0; 16],
             blit: None,
             output: gl::Texture::new(),
+            cpu,
             #[cfg(target_os = "windows")]
             ram: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -115,15 +183,18 @@ impl Instance {
             interop_failed: std::env::var("VFX_FFGL_PATH").as_deref() == Ok("ram"),
         }
     }
+
+    fn effect_values(&self) -> ParamValues {
+        params::values(table(), &self.values, vfx_host::plugin().params())
+    }
 }
 
-/// The only exported entry point of an FFGL plugin.
+/// The FFGL dispatcher, behind the plugin's `plugMain`.
 ///
 /// # Safety
-/// Called by the host with the FFGL ABI: `input` is valid for `code`, and `instance` is
-/// null or a value this function returned from FF_INSTANTIATE_GL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn plugMain(code: u32, input: FFMixed, instance: *mut c_void) -> FFMixed {
+/// Called with the FFGL ABI: `input` is valid for `code`, and `instance` is null or a value
+/// this function returned from FF_INSTANTIATE_GL.
+pub unsafe fn plug_main(code: u32, input: FFMixed, instance: *mut c_void) -> FFMixed {
     // A panic must not unwind into the host.
     catch_unwind(AssertUnwindSafe(|| unsafe {
         dispatch(code, input, instance.cast())
@@ -134,9 +205,9 @@ pub unsafe extern "C" fn plugMain(code: u32, input: FFMixed, instance: *mut c_vo
     })
 }
 
-unsafe fn param_index(index: u32) -> Option<usize> {
+fn param_index(index: u32) -> Option<usize> {
     let i = index as usize;
-    (i < PARAMS.len()).then_some(i)
+    (i < table().len()).then_some(i)
 }
 
 /// Copies `text` into a host string buffer, as the FFGL SDK does (no terminator).
@@ -151,30 +222,29 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
     let me = unsafe { inst.as_mut() };
     // SAFETY (all reads of `input`): the host puts the value type `code` defines there.
     let index = unsafe { input.uint };
+    let table = table();
     match code {
-        FF_GET_INFO => FFMixed::ptr(&INFO),
+        FF_GET_INFO => FFMixed::ptr(&statics().info),
         FF_INITIALISE_V2 | FF_DEINITIALISE => FFMixed::success(),
-        FF_GET_EXTENDED_INFO => FFMixed::ptr(&EXTENDED_INFO),
-        FF_GET_PLUGIN_SHORT_NAME => {
-            FFMixed::ptr(vfx_wrapper_common::plugin_cstr!("VFX_PLUGIN_NAME").as_ptr())
-        }
+        FF_GET_EXTENDED_INFO => FFMixed::ptr(&statics().extended),
+        FF_GET_PLUGIN_SHORT_NAME => FFMixed::ptr(statics().short_name.as_ptr()),
         FF_GET_PLUGIN_CAPS => FFMixed::uint(match index {
             FF_CAP_SET_TIME => FF_TRUE,
             FF_CAP_MINIMUM_INPUT_FRAMES | FF_CAP_MAXIMUM_INPUT_FRAMES => 1,
             _ => FF_FALSE,
         }),
         FF_ENABLE_PLUGIN_CAP => FFMixed::fail(),
-        FF_GET_NUM_PARAMETERS => FFMixed::uint(PARAMS.len() as u32),
-        FF_GET_PARAMETER_NAME => match unsafe { param_index(index) } {
-            Some(i) => FFMixed::ptr(PARAMS[i].name.as_ptr()),
+        FF_GET_NUM_PARAMETERS => FFMixed::uint(table.len() as u32),
+        FF_GET_PARAMETER_NAME => match param_index(index) {
+            Some(i) => FFMixed::ptr(table[i].name.as_ptr()),
             None => FFMixed::ptr(std::ptr::null::<c_char>()),
         },
-        FF_GET_PARAMETER_TYPE => match unsafe { param_index(index) } {
-            Some(i) => FFMixed::uint(PARAMS[i].kind),
+        FF_GET_PARAMETER_TYPE => match param_index(index) {
+            Some(i) => FFMixed::uint(table[i].kind),
             None => FFMixed::fail(),
         },
-        FF_GET_PARAMETER_DEFAULT => match unsafe { param_index(index) } {
-            Some(i) => FFMixed::float(PARAMS[i].default),
+        FF_GET_PARAMETER_DEFAULT => match param_index(index) {
+            Some(i) => FFMixed::float(table[i].default),
             None => FFMixed::fail(),
         },
         FF_GET_PARAMETER_USAGE => FFMixed::uint(FF_USAGE_STANDARD),
@@ -182,11 +252,11 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
         FF_GET_RANGE => {
             // SAFETY: a host-owned GetRangeStruct.
             let r = unsafe { &mut *input.ptr.cast::<GetRangeStruct>() };
-            match unsafe { param_index(r.parameter_number) } {
+            match param_index(r.parameter_number) {
                 Some(i) => {
                     r.range = RangeStruct {
-                        min: PARAMS[i].min,
-                        max: PARAMS[i].max,
+                        min: table[i].min,
+                        max: table[i].max,
                     };
                     FFMixed::success()
                 }
@@ -196,12 +266,12 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
         FF_GET_PARAM_GROUP | FF_GET_PARAM_DISPLAY_NAME => {
             // SAFETY: a host-owned GetStringStruct.
             let g = unsafe { &*input.ptr.cast::<GetStringStruct>() };
-            match unsafe { param_index(g.parameter_number) } {
+            match param_index(g.parameter_number) {
                 Some(i) if g.string_buffer.max_to_write > 0 => {
                     let text = if code == FF_GET_PARAM_GROUP {
-                        PARAMS[i].group.to_owned()
+                        table[i].group.clone()
                     } else {
-                        PARAMS[i].name.to_string_lossy().into_owned()
+                        table[i].name.to_string_lossy().into_owned()
                     };
                     unsafe { write_string(&g.string_buffer, &text) };
                     FFMixed::success()
@@ -209,15 +279,15 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                 _ => FFMixed::fail(),
             }
         }
-        FF_GET_NUM_PARAMETER_ELEMENTS => match unsafe { param_index(index) } {
-            Some(i) => FFMixed::uint(PARAMS[i].options.len() as u32),
+        FF_GET_NUM_PARAMETER_ELEMENTS => match param_index(index) {
+            Some(i) => FFMixed::uint(table[i].options.len() as u32),
             None => FFMixed::fail(),
         },
         FF_GET_PARAMETER_ELEMENT_NAME | FF_GET_PARAMETER_ELEMENT_VALUE => {
             // SAFETY: a host-owned GetParameterElement*Struct (same layout).
             let e = unsafe { &*input.ptr.cast::<GetParameterElementStruct>() };
-            let option = unsafe { param_index(e.parameter_number) }
-                .and_then(|i| PARAMS[i].options.get(e.element_number as usize));
+            let option = param_index(e.parameter_number)
+                .and_then(|i| table[i].options.get(e.element_number as usize));
             match (code, option) {
                 (FF_GET_PARAMETER_ELEMENT_NAME, Some(name)) => FFMixed::ptr(name.as_ptr()),
                 (_, Some(_)) => FFMixed::float(e.element_number as f32),
@@ -260,6 +330,9 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
                 let mut instance = unsafe { Box::from_raw(inst) };
                 unsafe {
                     instance.output.delete();
+                    if let Some(canvas) = instance.cpu.as_mut().and_then(|c| c.ram.take()) {
+                        canvas.delete();
+                    }
                     #[cfg(target_os = "windows")]
                     if let Some(canvas) = instance.ram.take() {
                         canvas.delete();
@@ -285,7 +358,16 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
         FF_SET_TIME => match me {
             Some(me) if !unsafe { input.ptr }.is_null() => {
                 // SAFETY: the host passes a pointer to a double, in seconds.
-                me.time = unsafe { *input.ptr.cast::<f64>() };
+                let time = unsafe { *input.ptr.cast::<f64>() };
+                if time.is_finite() {
+                    // A CPU effect's earlier frames are the ones before this time.
+                    if me.time.is_some_and(|previous| time < previous)
+                        && let Some(cpu) = &mut me.cpu
+                    {
+                        cpu.history.clear();
+                    }
+                    me.time = Some(time);
+                }
                 FFMixed::success()
             }
             _ => FFMixed::fail(),
@@ -293,23 +375,23 @@ unsafe fn dispatch(code: u32, input: FFMixed, inst: *mut Instance) -> FFMixed {
         FF_SET_PARAMETER => {
             // SAFETY: a host-owned SetParameterStruct.
             let s = unsafe { &*input.ptr.cast::<SetParameterStruct>() };
-            match (me, unsafe { param_index(s.parameter_number) }) {
+            match (me, param_index(s.parameter_number)) {
                 (Some(me), Some(i)) => {
                     let value = f32::from_bits(unsafe { s.new_parameter_value.uint });
-                    me.values[i] = params::clamp(i, value);
+                    me.values[i] = params::clamp(&table[i], value);
                     FFMixed::success()
                 }
                 _ => FFMixed::fail(),
             }
         }
         FF_SET_PARAMETER_ELEMENT_VALUE => FFMixed::fail(),
-        FF_GET_PARAMETER => match (me, unsafe { param_index(index) }) {
+        FF_GET_PARAMETER => match (me, param_index(index)) {
             (Some(me), Some(i)) => FFMixed::float(me.values[i]),
             _ => FFMixed::fail(),
         },
-        FF_GET_PARAMETER_DISPLAY => match (me, unsafe { param_index(index) }) {
+        FF_GET_PARAMETER_DISPLAY => match (me, param_index(index)) {
             (Some(me), Some(i)) => {
-                let text = params::display(i, me.values[i]);
+                let text = params::display(&table[i], me.values[i]);
                 let n = text.len().min(me.display.len() - 1);
                 me.display = [0; 16];
                 me.display[..n].copy_from_slice(&text.as_bytes()[..n]);
@@ -339,13 +421,101 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
     let Some(tex) = (unsafe { (*args.input_textures).as_ref() }) else {
         return false;
     };
-    let Some(blit) = me.blit.as_ref() else {
-        return false;
-    };
     let (w, h) = (tex.width, tex.height);
     if w == 0 || h == 0 {
         return true;
     }
+    if w > i32::MAX as u32
+        || h > i32::MAX as u32
+        || tex.hardware_width < w
+        || tex.hardware_height < h
+    {
+        return false;
+    }
+    if vfx_host::plugin().kind == Kind::Cpu {
+        // SAFETY: the caller's context and texture, passed on.
+        unsafe { process_cpu(me, args, tex) }
+    } else {
+        // SAFETY: as above.
+        unsafe { process_gpu(me, args, tex) }
+    }
+}
+
+/// A CPU effect: the frame through RAM as ARGB bytes, into the history, rendered and back.
+unsafe fn process_cpu(
+    me: &mut Instance,
+    args: &ProcessOpenGLStruct,
+    tex: &FFGLTextureStruct,
+) -> bool {
+    let values = me.effect_values();
+    let time = me.time.unwrap_or(0.0);
+    let (w, h) = (tex.width, tex.height);
+    let Some(cpu) = me.cpu.as_mut() else {
+        return false;
+    };
+    if cpu.ram.as_ref().is_none_or(|canvas| canvas.size != (w, h)) {
+        // SAFETY: all objects belong to the current host context.
+        unsafe {
+            if let Some(old) = cpu.ram.take() {
+                old.delete();
+            }
+            match transfer::Canvas::new((w, h)) {
+                Ok(canvas) => cpu.ram = Some(canvas),
+                Err(e) => {
+                    LOG.note(&format!("warning: {e}"));
+                    return false;
+                }
+            }
+        }
+        cpu.history.resize(w as i32, h as i32);
+        cpu.rendered
+            .resize(w as usize * h as usize, Argb::default());
+    }
+    let before = cpu.effect.frames_before(&values);
+    let canvas = cpu.ram.as_ref().expect("made above");
+    // SAFETY: the context is current and the canvas has the declared image size.
+    unsafe {
+        canvas.read(
+            tex.handle,
+            (tex.hardware_width, tex.hardware_height),
+            args.host_fbo,
+            cpu.history.next(before),
+        )
+    };
+    let ctx = Context {
+        frame: cpu.history.frame_number(),
+        ..Context::at(time)
+    };
+    let count = cpu.history.len();
+    let out = ImageMut::U8(ViewMut::from_pixels(&mut cpu.rendered, w as i32, h as i32));
+    let rendered = catch_unwind(AssertUnwindSafe(|| {
+        cpu.effect
+            .render(&mut cpu.history, count, out, &values, &ctx)
+    }));
+    if rendered.is_err() {
+        LOG.note("warning: CPU render failed");
+        return false;
+    }
+    // SAFETY: the output storage holds the full straight, top-down image.
+    unsafe {
+        me.output
+            .upload_bytes((w, h), transfer::bytes(&cpu.rendered));
+        canvas.draw(me.output.handle);
+    }
+    LOG.note("render path: CPU effect through RAM (texture readback)");
+    true
+}
+
+/// A GPU effect: GPU-native where the platform allows, else through RAM.
+unsafe fn process_gpu(
+    me: &mut Instance,
+    args: &ProcessOpenGLStruct,
+    tex: &FFGLTextureStruct,
+) -> bool {
+    let Some(blit) = me.blit.as_ref() else {
+        return false;
+    };
+    let (w, h) = (tex.width, tex.height);
     let pass_through = |blit: &gl::Blit| unsafe {
         let max_uv = [
             w as f32 / tex.hardware_width.max(1) as f32,
@@ -354,7 +524,8 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         blit.draw(tex.handle, gl::TEXTURE_2D, max_uv);
         true
     };
-    let settings = params::settings(&me.values, w, h);
+    let values = me.effect_values();
+    let ctx = Context::at(me.time.unwrap_or(0.0));
 
     #[cfg(target_os = "windows")]
     if !me.interop_failed {
@@ -378,8 +549,8 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
             // SAFETY: the context is current and the host supplies its texture and FBO.
             let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
                 interop.render(
-                    &settings,
-                    me.time,
+                    &values,
+                    ctx,
                     tex.handle,
                     (tex.hardware_width, tex.hardware_height),
                     args.host_fbo,
@@ -404,7 +575,7 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         }
     }
 
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = vfx_host::gpu(&LOG) else {
         return pass_through(blit);
     };
 
@@ -428,10 +599,9 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         if let Some(interop) = &me.interop {
             LOG.note("render path: GPU-native (IOSurface shared with OpenGL, no CPU copies)");
             let hardware = (tex.hardware_width, tex.hardware_height);
-            let time = me.time;
             // SAFETY: the context is current; the texture is the host's input.
             let rendered = catch_unwind(AssertUnwindSafe(|| unsafe {
-                interop.render(gpu, &settings, time, tex.handle, hardware, args.host_fbo)
+                interop.render(gpu, &values, ctx, tex.handle, hardware, args.host_fbo)
             }));
             if rendered.is_err() {
                 LOG.note("warning: GPU render failed, passing frames through");
@@ -475,13 +645,15 @@ unsafe fn process(me: &mut Instance, args: *const ProcessOpenGLStruct) -> bool {
         frame::texture_to_canvas(&texels, tex.hardware_width, w, h)
     };
     let job = pipeline::Job {
-        settings: &settings,
-        width: w,
-        height: h,
+        spec: pipeline::Spec {
+            values: &values,
+            ctx,
+            width: w,
+            height: h,
+            has_layer: false,
+        },
         input: &canvas,
         layer: None,
-        canvas_origin: [0.0, 0.0],
-        time: me.time,
     };
     LOG.note("render path: GPU through RAM (texture readback)");
     let Ok(result) = catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))) else {

@@ -1,35 +1,31 @@
-# The plugin for Resolume (FFGL)
+# The FFGL target (Resolume)
 
-The vfx-core effect chain as an FFGL 2.1 effect for Resolume Avenue and Arena, and
-other FFGL 2 hosts.
-
-On macOS:
+Any vfx-core effect as an FFGL 2.1 effect for Resolume Avenue and Arena, and other
+FFGL 2 hosts. An effect crate turns it on with its `ffgl` feature; `cargo vfx` builds it.
 
 ```bash
-wrappers/ffgl/bundle-mac.sh --install
+cargo vfx install -p vfx-chain --hosts ffgl
 ```
 
-This builds a universal `VfxPreview.bundle` (named from `plugin.env`) and copies it into
-`~/Documents/Resolume Avenue/Extra Effects` (and Arena's, if present). Restart Resolume,
-then find the plugin (**VFX Preview** by default) in the Effects browser.
-
-On Windows, from Git Bash with Rust installed:
-
-```bash
-wrappers/ffgl/bundle-win.sh --install
-```
-
-This builds `target/vfx-plugin/VfxPreview.dll` and copies it into the same Extra
-Effects folders under the user's Documents, when the Resolume folders exist.
-Without `--install` it only builds the DLL. The plugin needs a 64-bit FFGL host
-with OpenGL 4.1. It passes the mini host on Windows; Resolume there is untested.
+On macOS this builds a universal `VfxPreview.bundle` (named by the crate's
+`[package.metadata.vfx]`) and copies it into `~/Documents/Resolume Avenue/Extra Effects`
+(and Arena's, if present). On Windows, from Git Bash, it builds
+`target/vfx-plugin/VfxPreview.dll` and copies it into the same folders under the user's
+Documents, when they exist. `cargo vfx build --hosts ffgl` only builds. Restart Resolume,
+then find the effect (**VFX Preview**) in the Effects browser. The plugin needs a 64-bit
+FFGL host with OpenGL 4.1. It passes the mini host on Windows; Resolume there is untested.
 
 ## Controls
 
-Linear Light, then **Color** (brightness, contrast, saturation), **Vignette** (centre,
-radius, softness, colour, amount) and **Blur** (radius in composition pixels,
-direction). Blend and Blur Edges from the other plugins are left out: a second input
-would make this an FFGL mixer, and FFGL output is always the frame size.
+Every parameter the effect lists, in order, as FFGL standard parameters: colours and
+points split into one slider per component. Parameters that need a second layer
+(`Requires::Layer`) or room beyond the frame (`Requires::Region`) are left out: a second
+input would make this an FFGL mixer, and FFGL output is always the frame size. For VFX
+Preview that leaves Linear Light, Color, Vignette and Blur.
+
+GPU effects render on the GPU as below. CPU effects (`CpuEffect`) get the frame through
+RAM, and the target keeps the earlier frames they ask for, since FFGL hosts hand over one
+frame at a time.
 
 ## How frames move
 
@@ -84,6 +80,7 @@ The earlier RAM measurement was 28.1 / 48.7 ms; RAM timings vary between runs.
 wrappers/ffgl/minihost/run.sh
 ```
 
+It builds VFX Preview by default; `EFFECT=<crate>` builds another effect.
 `minihost/minihost.c` is a small FFGL host with a headless OpenGL 4.1 core context. It
 checks the plugin's info and parameter metadata, renders generated textures (including
 padded allocations) and checks the pixels, checks the GL state the plugin leaves

@@ -1,16 +1,14 @@
 [package]
-name = "vfx-adobe"
+name = "vfx-ae"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+description = "The After Effects host target: any vfx-core effect as a SmartFX plugin."
 
 [dependencies]
 vfx-core = { path = "../.." }
-vfx-wrapper-common = { path = "../common" }
+vfx-host = { path = "../common" }
 after-effects = "0.4.0"
 bytemuck = "1.25.2"
 pollster = "1.0.1"
@@ -20,5 +18,3 @@ pollster = "1.0.1"
 objc2 = "0.6.5"
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLBuffer", "MTLResource"] }
 
-[build-dependencies]
-pipl = "0.1.1"

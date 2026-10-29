@@ -1,222 +1,130 @@
-//! OpenFX controls, matching the After Effects plugin's, and reading them at a time.
+//! OpenFX controls for any effect, made from its parameter list, and reading them at a
+//! time. Each `ParamSpec` becomes one OpenFX parameter named by `spec.name`, the identifier
+//! hosts save; groups become group parameters (`color_group` for "Color").
 
-use std::ffi::{CStr, c_double, c_int};
+use std::ffi::{CStr, CString, c_double, c_int};
 use std::ptr;
 
-use vfx_core::effects::{BLEND_MODES, BLUR_DIRECTIONS};
+use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
 
 use crate::ffi::*;
 use crate::host::{Props, check, suites};
 use crate::optional;
 
-const LINEAR: &CStr = c"linear";
-const COLOR_ENABLE: &CStr = c"color_enable";
-const BRIGHTNESS: &CStr = c"brightness";
-const CONTRAST: &CStr = c"contrast";
-const SATURATION: &CStr = c"saturation";
-const VIGNETTE_ENABLE: &CStr = c"vignette_enable";
-const VIGNETTE_CENTER: &CStr = c"vignette_center";
-const VIGNETTE_RADIUS: &CStr = c"vignette_radius";
-const VIGNETTE_SOFTNESS: &CStr = c"vignette_softness";
-const VIGNETTE_COLOR: &CStr = c"vignette_color";
-const VIGNETTE_AMOUNT: &CStr = c"vignette_amount";
-const BLEND_MODE: &CStr = c"blend_mode";
-const BLEND_AMOUNT: &CStr = c"blend_amount";
-const BLUR_ENABLE: &CStr = c"blur_enable";
-const BLUR_RADIUS: &CStr = c"blur_radius";
-const BLUR_DIRECTION: &CStr = c"blur_direction";
-const BLUR_GROW: &CStr = c"blur_grow";
-
-/// One frame's control values, in full-resolution canonical units.
-#[derive(Clone, Copy, Debug)]
-pub struct Values {
-    pub linear: bool,
-    pub color: Option<[f32; 3]>,
-    pub vignette: Option<VignetteValues>,
-    pub blend_mode: i32,
-    pub blend_amount: f32,
-    pub blur: Option<BlurValues>,
+fn c_string(text: &str) -> Result<CString, OfxStatus> {
+    CString::new(text).map_err(|_| STAT_FAILED)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct VignetteValues {
-    /// Canonical coordinates: full-resolution pixels, origin at the bottom left.
-    pub center: [f64; 2],
-    pub radius: f32,
-    pub softness: f32,
-    pub color: [f32; 4],
-    pub amount: f32,
+/// A group's parameter name: "Color" → `color_group`.
+fn group_name(group: &str) -> String {
+    format!("{}_group", group.to_lowercase().replace(' ', "_"))
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct BlurValues {
-    /// Full-resolution pixels.
-    pub radius: f32,
-    pub direction: i32,
-    pub grow: bool,
-}
-
-struct Definer {
+fn define_one(
     set: ParamSet,
+    kind: &CStr,
+    name: &str,
+    label: &str,
+    parent: Option<&str>,
+) -> Result<Props, OfxStatus> {
+    let name = c_string(name)?;
+    let mut props = ptr::null_mut();
+    // SAFETY: a descriptor parameter set from the describe-in-context action.
+    check(unsafe { (suites().param.paramDefine)(set, kind.as_ptr(), name.as_ptr(), &mut props) })?;
+    let p = Props(props);
+    p.set_string(PROP_LABEL, label)?;
+    optional(
+        PARAM_PROP_SCRIPT_NAME,
+        p.set_str(PARAM_PROP_SCRIPT_NAME, 0, &name),
+    );
+    if let Some(parent) = parent {
+        let parent = c_string(&group_name(parent))?;
+        optional(PARAM_PROP_PARENT, p.set_str(PARAM_PROP_PARENT, 0, &parent));
+    }
+    Ok(p)
 }
 
-impl Definer {
-    fn define(
-        &self,
-        kind: &CStr,
-        name: &CStr,
-        label: &str,
-        parent: Option<&CStr>,
-    ) -> Result<Props, OfxStatus> {
-        let mut props = ptr::null_mut();
-        // SAFETY: a descriptor parameter set from the describe-in-context action.
-        check(unsafe {
-            (suites().param.paramDefine)(self.set, kind.as_ptr(), name.as_ptr(), &mut props)
-        })?;
-        let p = Props(props);
-        p.set_string(PROP_LABEL, label)?;
-        optional(
-            PARAM_PROP_SCRIPT_NAME,
-            p.set_str(PARAM_PROP_SCRIPT_NAME, 0, name),
-        );
-        if let Some(parent) = parent {
-            optional(PARAM_PROP_PARENT, p.set_str(PARAM_PROP_PARENT, 0, parent));
+/// Defines a control for every parameter the context can serve: those that need a second
+/// layer only when `layer` is set.
+pub fn define(set: ParamSet, specs: &[ParamSpec], layer: bool) -> Result<(), OfxStatus> {
+    let mut groups: Vec<&str> = Vec::new();
+    for spec in specs.iter().filter(|s| vfx_host::served(s, layer, true)) {
+        if !spec.group.is_empty() && !groups.contains(&spec.group) {
+            groups.push(spec.group);
+            define_one(
+                set,
+                PARAM_TYPE_GROUP,
+                &group_name(spec.group),
+                spec.group,
+                None,
+            )?;
         }
-        Ok(p)
-    }
-
-    fn group(&self, name: &CStr, label: &str) -> Result<(), OfxStatus> {
-        self.define(PARAM_TYPE_GROUP, name, label, None).map(|_| ())
-    }
-
-    fn toggle(
-        &self,
-        name: &CStr,
-        label: &str,
-        default: bool,
-        parent: Option<&CStr>,
-    ) -> Result<(), OfxStatus> {
-        let p = self.define(PARAM_TYPE_BOOLEAN, name, label, parent)?;
-        p.set_int(PARAM_PROP_DEFAULT, 0, default as i32)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn slider(
-        &self,
-        name: &CStr,
-        label: &str,
-        min: f64,
-        max: f64,
-        default: f64,
-        parent: &CStr,
-    ) -> Result<(), OfxStatus> {
-        let p = self.define(PARAM_TYPE_DOUBLE, name, label, Some(parent))?;
-        p.set_double(PARAM_PROP_DEFAULT, 0, default)?;
-        p.set_double(PARAM_PROP_MIN, 0, min)?;
-        p.set_double(PARAM_PROP_MAX, 0, max)?;
-        optional(
-            PARAM_PROP_DISPLAY_MIN,
-            p.set_double(PARAM_PROP_DISPLAY_MIN, 0, min),
-        );
-        optional(
-            PARAM_PROP_DISPLAY_MAX,
-            p.set_double(PARAM_PROP_DISPLAY_MAX, 0, max),
-        );
-        optional(
-            PARAM_PROP_INCREMENT,
-            p.set_double(PARAM_PROP_INCREMENT, 0, (max - min) / 200.0),
-        );
-        optional(PARAM_PROP_DIGITS, p.set_int(PARAM_PROP_DIGITS, 0, 2));
-        Ok(())
-    }
-
-    fn choice(
-        &self,
-        name: &CStr,
-        label: &str,
-        options: &[&str],
-        parent: &CStr,
-    ) -> Result<(), OfxStatus> {
-        let p = self.define(PARAM_TYPE_CHOICE, name, label, Some(parent))?;
-        for (i, option) in options.iter().enumerate() {
-            let option = std::ffi::CString::new(*option).map_err(|_| STAT_FAILED)?;
-            p.set_str(PARAM_PROP_CHOICE_OPTION, i, &option)?;
+        let parent = (!spec.group.is_empty()).then_some(spec.group);
+        let label = spec.display_label();
+        match spec.kind {
+            ParamKind::Float { min, max, default } => {
+                let p = define_one(set, PARAM_TYPE_DOUBLE, spec.name, &label, parent)?;
+                let [lo, hi] = spec.slider_range().unwrap_or([min, max]);
+                p.set_double(PARAM_PROP_DEFAULT, 0, f64::from(default))?;
+                p.set_double(PARAM_PROP_MIN, 0, f64::from(min))?;
+                p.set_double(PARAM_PROP_MAX, 0, f64::from(max))?;
+                optional(
+                    PARAM_PROP_DISPLAY_MIN,
+                    p.set_double(PARAM_PROP_DISPLAY_MIN, 0, f64::from(lo)),
+                );
+                optional(
+                    PARAM_PROP_DISPLAY_MAX,
+                    p.set_double(PARAM_PROP_DISPLAY_MAX, 0, f64::from(hi)),
+                );
+                optional(
+                    PARAM_PROP_INCREMENT,
+                    p.set_double(PARAM_PROP_INCREMENT, 0, f64::from(hi - lo) / 200.0),
+                );
+                optional(PARAM_PROP_DIGITS, p.set_int(PARAM_PROP_DIGITS, 0, 2));
+            }
+            ParamKind::Int {
+                default, options, ..
+            } if !options.is_empty() => {
+                let p = define_one(set, PARAM_TYPE_CHOICE, spec.name, &label, parent)?;
+                for (i, option) in options.iter().enumerate() {
+                    p.set_str(PARAM_PROP_CHOICE_OPTION, i, &c_string(option)?)?;
+                }
+                p.set_int(PARAM_PROP_DEFAULT, 0, default)?;
+            }
+            ParamKind::Int {
+                min, max, default, ..
+            } => {
+                let p = define_one(set, PARAM_TYPE_INTEGER, spec.name, &label, parent)?;
+                let [lo, hi] = spec.slider_range().unwrap_or([min as f32, max as f32]);
+                p.set_int(PARAM_PROP_DEFAULT, 0, default)?;
+                p.set_int(PARAM_PROP_MIN, 0, min)?;
+                p.set_int(PARAM_PROP_MAX, 0, max)?;
+                optional(
+                    PARAM_PROP_DISPLAY_MIN,
+                    p.set_int(PARAM_PROP_DISPLAY_MIN, 0, lo as c_int),
+                );
+                optional(
+                    PARAM_PROP_DISPLAY_MAX,
+                    p.set_int(PARAM_PROP_DISPLAY_MAX, 0, hi as c_int),
+                );
+            }
+            ParamKind::Bool { default } => {
+                let p = define_one(set, PARAM_TYPE_BOOLEAN, spec.name, &label, parent)?;
+                p.set_int(PARAM_PROP_DEFAULT, 0, default as c_int)?;
+            }
+            ParamKind::Color { default } => {
+                let p = define_one(set, PARAM_TYPE_RGBA, spec.name, &label, parent)?;
+                p.set_doubles(PARAM_PROP_DEFAULT, &default.map(f64::from))?;
+            }
+            ParamKind::Point { default: [x, y] } => {
+                let p = define_one(set, PARAM_TYPE_DOUBLE_2D, spec.name, &label, parent)?;
+                p.set_str(PARAM_PROP_DOUBLE_TYPE, 0, DOUBLE_TYPE_XY_ABSOLUTE)?;
+                p.set_str(PARAM_PROP_DEFAULT_COORDINATES, 0, COORDINATES_NORMALISED)?;
+                // OpenFX's normalised coordinates run up from the bottom left.
+                p.set_doubles(PARAM_PROP_DEFAULT, &[f64::from(x), f64::from(1.0 - y)])?;
+            }
         }
-        p.set_int(PARAM_PROP_DEFAULT, 0, 0)
     }
-}
-
-/// Defines every control. `blend` is false in the filter context, which has no second
-/// input clip to blend with.
-pub fn define(set: ParamSet, blend: bool) -> Result<(), OfxStatus> {
-    let d = Definer { set };
-    d.toggle(LINEAR, "Linear Light", false, None)?;
-
-    d.group(c"color_group", "Color")?;
-    d.toggle(COLOR_ENABLE, "Color Adjust", true, Some(c"color_group"))?;
-    d.slider(BRIGHTNESS, "Brightness", -1.0, 1.0, 0.0, c"color_group")?;
-    d.slider(CONTRAST, "Contrast", 0.0, 4.0, 1.0, c"color_group")?;
-    d.slider(SATURATION, "Saturation", 0.0, 4.0, 1.0, c"color_group")?;
-
-    d.group(c"vignette_group", "Vignette")?;
-    d.toggle(VIGNETTE_ENABLE, "Vignette", false, Some(c"vignette_group"))?;
-    let center = d.define(
-        PARAM_TYPE_DOUBLE_2D,
-        VIGNETTE_CENTER,
-        "Vignette Center",
-        Some(c"vignette_group"),
-    )?;
-    center.set_str(PARAM_PROP_DOUBLE_TYPE, 0, DOUBLE_TYPE_XY_ABSOLUTE)?;
-    center.set_str(PARAM_PROP_DEFAULT_COORDINATES, 0, COORDINATES_NORMALISED)?;
-    center.set_doubles(PARAM_PROP_DEFAULT, &[0.5, 0.5])?;
-    d.slider(
-        VIGNETTE_RADIUS,
-        "Vignette Radius",
-        0.0,
-        2.0,
-        0.75,
-        c"vignette_group",
-    )?;
-    d.slider(
-        VIGNETTE_SOFTNESS,
-        "Vignette Soft",
-        0.0,
-        1.0,
-        0.5,
-        c"vignette_group",
-    )?;
-    let color = d.define(
-        PARAM_TYPE_RGBA,
-        VIGNETTE_COLOR,
-        "Vignette Color",
-        Some(c"vignette_group"),
-    )?;
-    color.set_doubles(PARAM_PROP_DEFAULT, &[0.0, 0.0, 0.0, 1.0])?;
-    d.slider(
-        VIGNETTE_AMOUNT,
-        "Vignette Amount",
-        0.0,
-        1.0,
-        1.0,
-        c"vignette_group",
-    )?;
-
-    if blend {
-        d.group(c"blend_group", "Blend")?;
-        d.choice(BLEND_MODE, "Blend Mode", BLEND_MODES, c"blend_group")?;
-        d.slider(BLEND_AMOUNT, "Blend Amount", 0.0, 1.0, 1.0, c"blend_group")?;
-    }
-
-    d.group(c"blur_group", "Blur")?;
-    d.toggle(BLUR_ENABLE, "Blur", true, Some(c"blur_group"))?;
-    d.slider(BLUR_RADIUS, "Blur Radius", 0.0, 256.0, 0.0, c"blur_group")?;
-    d.choice(
-        BLUR_DIRECTION,
-        "Blur Direction",
-        BLUR_DIRECTIONS,
-        c"blur_group",
-    )?;
-    d.toggle(BLUR_GROW, "Blur Edges", false, Some(c"blur_group"))?;
     Ok(())
 }
 
@@ -234,18 +142,19 @@ impl Reader {
         Ok(Self { set, time })
     }
 
-    fn handle(&self, name: &CStr) -> Result<Option<Param>, OfxStatus> {
+    /// `None` when the parameter isn't defined in this context (blend controls in the
+    /// filter context).
+    fn handle(&self, name: &str) -> Result<Option<Param>, OfxStatus> {
+        let name = c_string(name)?;
         let mut param = ptr::null_mut();
         // SAFETY: an instance parameter set.
         let status = unsafe {
             (suites().param.paramGetHandle)(self.set, name.as_ptr(), &mut param, ptr::null_mut())
         };
-        // Missing means not defined in this context (Blend in the filter context).
         Ok((status == STAT_OK).then_some(param))
     }
 
-    fn doubles<const N: usize>(&self, name: &CStr) -> Result<[f64; N], OfxStatus> {
-        let p = self.handle(name)?.ok_or(STAT_FAILED)?;
+    fn doubles<const N: usize>(&self, p: Param) -> Result<[f64; N], OfxStatus> {
         let mut v = [0.0 as c_double; N];
         let s = suites().param;
         // SAFETY: the parameter has N double components, written through these pointers.
@@ -272,67 +181,46 @@ impl Reader {
         Ok(v)
     }
 
-    fn float(&self, name: &CStr) -> Result<f32, OfxStatus> {
-        Ok(self.doubles::<1>(name)?[0] as f32)
-    }
-
-    /// Booleans and choices are both read as ints. `None` if not defined here.
-    fn int(&self, name: &CStr) -> Result<Option<i32>, OfxStatus> {
-        let Some(p) = self.handle(name)? else {
-            return Ok(None);
-        };
+    fn int(&self, p: Param) -> Result<i32, OfxStatus> {
         let mut v: c_int = 0;
-        // SAFETY: a boolean or choice parameter, written through one int pointer.
+        // SAFETY: an integer, boolean or choice parameter, written through one int pointer.
         check(unsafe { (suites().param.paramGetValueAtTime)(p, self.time, &mut v as *mut c_int) })?;
-        Ok(Some(v))
+        Ok(v)
     }
 
-    fn flag(&self, name: &CStr) -> Result<bool, OfxStatus> {
-        Ok(self.int(name)?.unwrap_or(0) != 0)
+    /// Every parameter's value. Points stay in OpenFX's canonical coordinates (full
+    /// resolution pixels, y up); the render maps them to its canvas. Parameters this
+    /// context doesn't define keep their defaults.
+    pub fn values(&self, specs: &[ParamSpec]) -> Result<ParamValues, OfxStatus> {
+        let mut values = ParamValues::new(specs);
+        for spec in specs {
+            let Some(p) = self.handle(spec.name)? else {
+                continue;
+            };
+            let value = match spec.kind {
+                ParamKind::Float { .. } => ParamValue::Float(self.doubles::<1>(p)?[0] as f32),
+                ParamKind::Int { .. } => ParamValue::Int(self.int(p)?),
+                ParamKind::Bool { .. } => ParamValue::Bool(self.int(p)? != 0),
+                ParamKind::Color { .. } => {
+                    ParamValue::Color(self.doubles::<4>(p)?.map(|c| c as f32))
+                }
+                ParamKind::Point { .. } => {
+                    ParamValue::Point(self.doubles::<2>(p)?.map(|c| c as f32))
+                }
+            };
+            values.set(spec.name, value).map_err(|_| STAT_FAILED)?;
+        }
+        Ok(values)
     }
+}
 
-    pub fn values(&self) -> Result<Values, OfxStatus> {
-        let color = if self.flag(COLOR_ENABLE)? {
-            Some([
-                self.float(BRIGHTNESS)?,
-                self.float(CONTRAST)?,
-                self.float(SATURATION)?,
-            ])
-        } else {
-            None
-        };
-        let vignette = if self.flag(VIGNETTE_ENABLE)? {
-            let c = self.doubles::<4>(VIGNETTE_COLOR)?;
-            Some(VignetteValues {
-                center: self.doubles::<2>(VIGNETTE_CENTER)?,
-                radius: self.float(VIGNETTE_RADIUS)?,
-                softness: self.float(VIGNETTE_SOFTNESS)?,
-                color: [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32],
-                amount: self.float(VIGNETTE_AMOUNT)?,
-            })
-        } else {
-            None
-        };
-        let radius = self.float(BLUR_RADIUS)?;
-        let blur = (self.flag(BLUR_ENABLE)? && radius > 0.0)
-            .then(|| -> Result<_, OfxStatus> {
-                Ok(BlurValues {
-                    radius,
-                    direction: self.int(BLUR_DIRECTION)?.unwrap_or(0),
-                    grow: self.flag(BLUR_GROW)?,
-                })
-            })
-            .transpose()?;
-        Ok(Values {
-            linear: self.flag(LINEAR)?,
-            color,
-            vignette,
-            blend_mode: self.int(BLEND_MODE)?.unwrap_or(0),
-            blend_amount: match self.handle(BLEND_AMOUNT)? {
-                Some(_) => self.float(BLEND_AMOUNT)?,
-                None => 0.0,
-            },
-            blur,
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_keep_their_old_names() {
+        assert_eq!(group_name("Color"), "color_group");
+        assert_eq!(group_name("Swarm Tiles"), "swarm_tiles_group");
     }
 }

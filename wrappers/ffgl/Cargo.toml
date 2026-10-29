@@ -4,14 +4,12 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+description = "The FFGL host target: any vfx-core effect as an FFGL 2.1 plugin for Resolume."
 
 [dependencies]
 vfx-ffgl-common = { path = "../ffgl-common" }
 vfx-core = { path = "../.." }
-vfx-wrapper-common = { path = "../common" }
+vfx-host = { path = "../common" }
 pollster = "1.0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]

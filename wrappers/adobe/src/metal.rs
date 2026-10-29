@@ -13,8 +13,8 @@ use objc2_metal::{MTLBuffer, MTLDevice};
 use vfx_core::Gpu;
 use vfx_core::wgpu::{self, hal};
 
-use crate::params::Settings;
-use vfx_wrapper_common::pipeline::{FRAME_FORMAT, Lease, Spec};
+use vfx_core::{Context, ParamValues};
+use vfx_host::pipeline::{FRAME_FORMAT, Lease, Spec};
 
 /// Bytes per pixel in After Effects' GPU worlds (`PF_PixelFormat_GPU_BGRA128`).
 pub const BYTES_PER_PIXEL: usize = 16;
@@ -102,7 +102,7 @@ impl AeDevice {
         // Ask for the adapter's real limits. The defaults cap storage buffers at
         // 128 MiB, which a 4K float frame nearly fills.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("vfx-adobe on After Effects GPU"),
+            label: Some("vfx-ae on After Effects GPU"),
             required_limits: adapter.limits(),
             ..Default::default()
         }))
@@ -260,22 +260,23 @@ pub struct World {
     pub origin: [i32; 2],
 }
 
-/// Renders one frame entirely on After Effects' GPU.
+/// Renders one frame entirely on After Effects' GPU. Point values are already in the
+/// output canvas's normalised coordinates.
 pub fn render(
     dev: &AeDevice,
-    settings: &Settings,
+    values: &ParamValues,
+    ctx: Context,
     input: &World,
     layer: Option<&World>,
     output: &World,
-    time: f64,
 ) {
     let gpu = &dev.gpu;
     let spec = Spec {
-        settings,
+        values,
+        ctx,
         width: output.width,
         height: output.height,
         has_layer: layer.is_some(),
-        canvas_origin: [output.origin[0] as f32, output.origin[1] as f32],
     };
     let mut lease = Lease::new(gpu, dev.pool_key, &spec);
 
@@ -336,7 +337,7 @@ pub fn render(
     }
     gpu.queue.submit(Some(encoder.finish()));
 
-    lease.render(gpu, time);
+    lease.render(gpu);
 
     let u: [u32; 4] = [output.width, output.height, output.pitch, 0];
     let ubuf = uniform_buffer(gpu, bytemuck::bytes_of(&u));
@@ -386,7 +387,6 @@ fn uniform_buffer(gpu: &Gpu, bytes: &[u8]) -> wgpu::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::Settings;
 
     /// Opens our device on a real `MTLDevice`, as After Effects would hand us, and checks
     /// it really is the same GPU.
@@ -441,15 +441,9 @@ mod tests {
             pitch: 2,
             origin: [0, 0],
         };
-        let settings = Settings {
-            linear: false,
-            color: None,
-            vignette: None,
-            blend_mode: 0,
-            blend_amount: 1.0,
-            blur: None,
-        };
-        render(&dev, &settings, &input, None, &output, 0.0);
+        crate::tests::register_test_plugin();
+        let values = vfx_host::plugin().defaults();
+        render(&dev, &values, Context::at(0.0), &input, None, &output);
 
         let readback = dev.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,

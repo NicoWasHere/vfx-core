@@ -1,13 +1,13 @@
 ; The Windows installer for the vfx-core plugins: OpenFX (Resolve, Nuke, Natron), FFGL
-; (Resolume) and After Effects / Premiere Pro. package-win.sh builds the plugins and runs
-; this with the plugin's names from plugin.env:
+; (Resolume) and After Effects / Premiere Pro. package-win.sh builds an effect's plugins and
+; runs this with its names from the effect crate's [package.metadata.vfx]:
 ;   ISCC -DVersion=1.2.3 -DSource=<built plugins> -DAppName=... -DPublisher=... -DPluginFile=...
 ;        -DAppGuid=... installer-win.iss
 ; Only the plugins found in Source are offered. -DTestRoot=<folder> installs everything
 ; under that folder instead, without administrator rights, for testing the installer.
 
 #ifndef AppName
-  #error Build this with package-win.sh, which passes the names from plugin.env.
+  #error Build this with package-win.sh, which passes the effect's names.
 #endif
 #ifndef Version
   #define Version "dev"

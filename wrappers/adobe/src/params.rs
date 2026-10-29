@@ -1,267 +1,211 @@
-//! After Effects controls, and reading them into plain settings for one frame.
-//! This is the only place that knows both the After Effects parameter API and the
-//! core effects' value ranges.
+//! After Effects controls for any effect, made from its parameter list, and reading them
+//! back as the effect's values. Each control's disk ID is a hash of its key's name (the
+//! after-effects crate hashes the key's `Debug` text), so a control keeps its saved values
+//! when others are added or reordered.
 
 use after_effects as ae;
-use vfx_core::effects::{BLEND_MODES, BLUR_DIRECTIONS};
-pub use vfx_wrapper_common::{Blur, Settings, Vignette};
+use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues, Unit};
 
-#[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
-pub enum Params {
-    LinearLight,
-    ColorEnable,
-    Brightness,
-    Contrast,
-    Saturation,
-    VignetteEnable,
-    VignetteCenter,
-    VignetteRadius,
-    VignetteSoftness,
-    VignetteColor,
-    VignetteAmount,
-    BlendLayer,
-    BlendMode,
-    BlendAmount,
-    BlurEnable,
-    BlurRadius,
-    BlurDirection,
-    BlurGrow,
+/// A control: a parameter's name, or one of the wrapper's own (the layer, group ends).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Key(pub &'static str);
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
 }
 
-pub fn setup(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
-    checkbox(
-        params,
-        Params::LinearLight,
-        "Linear Light",
-        "Process in linear light",
-        false,
-    )?;
+/// The layer picker, for effects that read a second layer.
+pub const LAYER: Key = Key("layer");
 
-    checkbox(params, Params::ColorEnable, "Color Adjust", "On", true)?;
-    slider(params, Params::Brightness, "Brightness", -1.0, 1.0, 0.0)?;
-    slider(params, Params::Contrast, "Contrast", 0.0, 4.0, 1.0)?;
-    slider(params, Params::Saturation, "Saturation", 0.0, 4.0, 1.0)?;
+/// `name` with a prefix, leaked once per group: group keys need 'static names.
+fn group_key(prefix: &str, group: &str) -> Key {
+    Key(Box::leak(format!("{prefix}:{group}").into_boxed_str()))
+}
 
-    checkbox(params, Params::VignetteEnable, "Vignette", "On", false)?;
-    params.add(
-        Params::VignetteCenter,
-        "Vignette Center",
-        ae::PointDef::setup(|p| {
-            // Percent of the layer, so the default is the middle.
-            p.set_default((50.0, 50.0));
-        }),
-    )?;
-    slider(
-        params,
-        Params::VignetteRadius,
-        "Vignette Radius",
-        0.0,
-        2.0,
-        0.75,
-    )?;
-    slider(
-        params,
-        Params::VignetteSoftness,
-        "Vignette Soft",
-        0.0,
-        2.0,
-        0.5,
-    )?;
-    params.add(
-        Params::VignetteColor,
-        "Vignette Color",
-        ae::ColorDef::setup(|c| {
-            c.set_default(ae::Pixel8 {
-                alpha: 255,
-                red: 0,
-                green: 0,
-                blue: 0,
-            });
-        }),
-    )?;
-    slider(
-        params,
-        Params::VignetteAmount,
-        "Vignette Amount",
-        0.0,
-        1.0,
-        1.0,
-    )?;
-
-    params.add(Params::BlendLayer, "Blend Layer", ae::LayerDef::new())?;
-    popup(params, Params::BlendMode, "Blend Mode", BLEND_MODES, 0)?;
-    slider(params, Params::BlendAmount, "Blend Amount", 0.0, 1.0, 1.0)?;
-
-    checkbox(params, Params::BlurEnable, "Blur", "On", true)?;
-    slider(params, Params::BlurRadius, "Blur Radius", 0.0, 256.0, 0.0)?;
-    popup(
-        params,
-        Params::BlurDirection,
-        "Blur Direction",
-        BLUR_DIRECTIONS,
-        0,
-    )?;
-    checkbox(
-        params,
-        Params::BlurGrow,
-        "Blur Edges",
-        "Grow past layer bounds",
-        false,
-    )?;
+/// Defines every control: `specs` in order, consecutive ones with a group inside it, and
+/// the layer picker (when `layer_name` is given) before the first control that needs it.
+pub fn setup(
+    params: &mut ae::Parameters<Key>,
+    specs: &'static [ParamSpec],
+    layer_name: Option<&str>,
+) -> Result<(), ae::Error> {
+    let mut layer_added = false;
+    let mut i = 0;
+    while i < specs.len() {
+        let group = specs[i].group;
+        let end = specs[i..]
+            .iter()
+            .position(|s| s.group != group)
+            .map_or(specs.len(), |n| i + n);
+        let run = &specs[i..end];
+        let mut add_run = |params: &mut ae::Parameters<Key>| -> Result<(), ae::Error> {
+            for spec in run {
+                if let Some(name) = layer_name
+                    && !layer_added
+                    && spec.requires == vfx_core::Requires::Layer
+                {
+                    params.add(LAYER, name, ae::LayerDef::new())?;
+                    layer_added = true;
+                }
+                add(params, spec)?;
+            }
+            Ok(())
+        };
+        if group.is_empty() {
+            add_run(params)?;
+        } else {
+            params.add_group(
+                group_key("group", group),
+                group_key("end", group),
+                group,
+                false,
+                |params| add_run(params),
+            )?;
+        }
+        i = end;
+    }
+    if let Some(name) = layer_name
+        && !layer_added
+    {
+        params.add(LAYER, name, ae::LayerDef::new())?;
+    }
     Ok(())
 }
 
-fn slider(
-    params: &mut ae::Parameters<Params>,
-    id: Params,
-    name: &str,
-    min: f32,
-    max: f32,
-    default: f32,
-) -> Result<(), ae::Error> {
-    params.add(
-        id,
-        name,
-        ae::FloatSliderDef::setup(|f| {
-            f.set_valid_min(min);
-            f.set_valid_max(max);
-            f.set_slider_min(min);
-            f.set_slider_max(max);
-            f.set_default(default as f64);
-            f.set_precision(2);
-        }),
-    )
-}
-
-fn checkbox(
-    params: &mut ae::Parameters<Params>,
-    id: Params,
-    name: &str,
-    label: &str,
-    default: bool,
-) -> Result<(), ae::Error> {
-    params.add(
-        id,
-        name,
-        ae::CheckBoxDef::setup(|c| {
-            c.set_default(default);
-            c.set_label(label);
-        }),
-    )
-}
-
-/// After Effects popups are 1-based; `default` here is 0-based like the core's options.
-fn popup(
-    params: &mut ae::Parameters<Params>,
-    id: Params,
-    name: &str,
-    options: &[&str],
-    default: i32,
-) -> Result<(), ae::Error> {
-    params.add(
-        id,
-        name,
-        ae::PopupDef::setup(|p| {
-            p.set_options(options);
-            p.set_default(default + 1);
-        }),
-    )
-}
-
-/// Reads one frame's controls into the core's units.
-pub fn read_settings(
-    params: &ae::Parameters<Params>,
-    in_data: &ae::InData,
-) -> Result<Settings, ae::Error> {
-    // Slider values are in full-resolution pixels. At Half, Third or Quarter preview
-    // resolution, After Effects hands us a smaller buffer, so pixel distances shrink
-    // by the same factor.
-    let scale = |r: ae::RationalScale| {
-        if r.den == 0 {
-            1.0
-        } else {
-            r.num as f32 / r.den as f32
+fn add(params: &mut ae::Parameters<Key>, spec: &'static ParamSpec) -> Result<(), ae::Error> {
+    let key = Key(spec.name);
+    let label = spec.display_label();
+    match spec.kind {
+        ParamKind::Float { min, max, default } => {
+            let [lo, hi] = spec.slider_range().unwrap_or([min, max]);
+            params.add(
+                key,
+                &label,
+                ae::FloatSliderDef::setup(|f| {
+                    f.set_valid_min(min);
+                    f.set_valid_max(max);
+                    f.set_slider_min(lo);
+                    f.set_slider_max(hi);
+                    f.set_default(f64::from(default));
+                    f.set_precision(2);
+                    match spec.unit {
+                        Unit::Percent => f.set_display_flags(ae::ValueDisplayFlag::PERCENT),
+                        Unit::Pixels => f.set_display_flags(ae::ValueDisplayFlag::PIXEL),
+                        Unit::Plain => f,
+                    };
+                }),
+            )
         }
-    };
-    let (dx, dy) = (scale(in_data.downsample_x()), scale(in_data.downsample_y()));
-
-    let color = checkbox_value(params, Params::ColorEnable)?.then_some([
-        float(params, Params::Brightness)?,
-        float(params, Params::Contrast)?,
-        float(params, Params::Saturation)?,
-    ]);
-    let vignette = if checkbox_value(params, Params::VignetteEnable)? {
-        Some(Vignette {
-            center_px: point(params, Params::VignetteCenter)?,
-            radius: float(params, Params::VignetteRadius)?,
-            softness: float(params, Params::VignetteSoftness)?,
-            color: color_value(params, Params::VignetteColor)?,
-            amount: float(params, Params::VignetteAmount)?,
-        })
-    } else {
-        None
-    };
-    let blur_radius = float(params, Params::BlurRadius)? * dx;
-    let blur = (checkbox_value(params, Params::BlurEnable)? && blur_radius > 0.0).then_some(Blur {
-        radius: blur_radius,
-        vertical_scale: if dx > 0.0 { dy / dx } else { 1.0 },
-        direction: popup_value(params, Params::BlurDirection)?,
-        grow: checkbox_value(params, Params::BlurGrow)?,
-    });
-    Ok(Settings {
-        linear: checkbox_value(params, Params::LinearLight)?,
-        color,
-        vignette,
-        blend_mode: popup_value(params, Params::BlendMode)?,
-        blend_amount: float(params, Params::BlendAmount)?,
-        blur,
-    })
-}
-
-fn float(params: &ae::Parameters<Params>, id: Params) -> Result<f32, ae::Error> {
-    match params.get(id)?.as_param()? {
-        ae::Param::FloatSlider(s) => Ok(s.value() as f32),
-        _ => Err(ae::Error::BadCallbackParameter),
-    }
-}
-
-fn checkbox_value(params: &ae::Parameters<Params>, id: Params) -> Result<bool, ae::Error> {
-    match params.get(id)?.as_param()? {
-        ae::Param::CheckBox(c) => Ok(c.value()),
-        _ => Err(ae::Error::BadCallbackParameter),
-    }
-}
-
-/// 0-based option index.
-fn popup_value(params: &ae::Parameters<Params>, id: Params) -> Result<i32, ae::Error> {
-    match params.get(id)?.as_param()? {
-        ae::Param::Popup(p) => Ok(p.value() - 1),
-        _ => Err(ae::Error::BadCallbackParameter),
-    }
-}
-
-fn point(params: &ae::Parameters<Params>, id: Params) -> Result<[f32; 2], ae::Error> {
-    match params.get(id)?.as_param()? {
-        ae::Param::Point(p) => {
-            let (x, y) = p.value();
-            Ok([x, y])
+        ParamKind::Int {
+            default, options, ..
+        } if !options.is_empty() => params.add(
+            key,
+            &label,
+            ae::PopupDef::setup(|p| {
+                p.set_options(options);
+                // After Effects popups are 1-based.
+                p.set_default(default + 1);
+            }),
+        ),
+        ParamKind::Int {
+            min, max, default, ..
+        } => {
+            let [lo, hi] = spec.slider_range().unwrap_or([min as f32, max as f32]);
+            params.add(
+                key,
+                &label,
+                ae::SliderDef::setup(|s| {
+                    s.set_valid_min(min);
+                    s.set_valid_max(max);
+                    s.set_slider_min(lo as i32);
+                    s.set_slider_max(hi as i32);
+                    s.set_default(default);
+                }),
+            )
         }
-        _ => Err(ae::Error::BadCallbackParameter),
+        ParamKind::Bool { default } => params.add(
+            key,
+            &label,
+            ae::CheckBoxDef::setup(|c| {
+                c.set_default(default);
+                c.set_label("On");
+            }),
+        ),
+        ParamKind::Color { default } => {
+            let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            params.add(
+                key,
+                &label,
+                ae::ColorDef::setup(|c| {
+                    c.set_default(ae::Pixel8 {
+                        alpha: byte(default[3]),
+                        red: byte(default[0]),
+                        green: byte(default[1]),
+                        blue: byte(default[2]),
+                    });
+                }),
+            )
+        }
+        ParamKind::Point { default: [x, y] } => params.add(
+            key,
+            &label,
+            ae::PointDef::setup(|p| {
+                // Percent of the layer.
+                p.set_default((x * 100.0, y * 100.0));
+            }),
+        ),
     }
 }
 
-fn color_value(params: &ae::Parameters<Params>, id: Params) -> Result<[f32; 4], ae::Error> {
-    match params.get(id)?.as_param()? {
-        ae::Param::Color(c) => {
-            // Prefer the float colour (it keeps precision in 16/32 bpc projects).
-            if let Ok(f) = c.float_value() {
-                Ok([f.red, f.green, f.blue, f.alpha])
-            } else {
-                let p = c.value();
-                let n = |v: u8| f32::from(v) / 255.0;
-                Ok([n(p.red), n(p.green), n(p.blue), n(p.alpha)])
+/// Every control's value. Points stay in layer pixels at the current render scale; the
+/// render maps them to its canvas.
+pub fn read(params: &ae::Parameters<Key>, specs: &[ParamSpec]) -> Result<ParamValues, ae::Error> {
+    let mut values = ParamValues::new(specs);
+    for spec in specs {
+        let Ok(param) = params.get(Key(spec.name)) else {
+            continue;
+        };
+        let value = match (spec.kind, param.as_param()?) {
+            (ParamKind::Float { .. }, ae::Param::FloatSlider(s)) => {
+                ParamValue::Float(s.value() as f32)
             }
-        }
-        _ => Err(ae::Error::BadCallbackParameter),
+            (ParamKind::Int { .. }, ae::Param::Popup(p)) => ParamValue::Int(p.value() - 1),
+            (ParamKind::Int { .. }, ae::Param::Slider(s)) => ParamValue::Int(s.value()),
+            (ParamKind::Bool { .. }, ae::Param::CheckBox(c)) => ParamValue::Bool(c.value()),
+            (ParamKind::Color { .. }, ae::Param::Color(c)) => {
+                // The float colour keeps precision in 16/32 bpc projects.
+                ParamValue::Color(match c.float_value() {
+                    Ok(f) => [f.red, f.green, f.blue, f.alpha],
+                    Err(_) => {
+                        let p = c.value();
+                        let n = |v: u8| f32::from(v) / 255.0;
+                        [n(p.red), n(p.green), n(p.blue), n(p.alpha)]
+                    }
+                })
+            }
+            (ParamKind::Point { .. }, ae::Param::Point(p)) => {
+                let (x, y) = p.value();
+                ParamValue::Point([x, y])
+            }
+            _ => return Err(ae::Error::BadCallbackParameter),
+        };
+        values
+            .set(spec.name, value)
+            .map_err(|_| ae::Error::BadCallbackParameter)?;
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_debug_as_their_names() {
+        // The crate's disk IDs hash this text, so it must be the bare name.
+        assert_eq!(format!("{:?}", Key("blur_radius")), "blur_radius");
+        assert_eq!(format!("{:?}", group_key("group", "Blur")), "group:Blur");
     }
 }
