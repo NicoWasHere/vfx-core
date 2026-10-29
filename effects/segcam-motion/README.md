@@ -38,14 +38,11 @@ the two render byte-identical frames (see [Checking it](#checking-it)).
 
 ## How it renders
 
-Every render is rebuilt from the frames it is given, so the effect keeps no state: it asks
-for the **Background** frames before the current one (plus **Trail frames** - 1 in Swarm
-mode) through `CpuEffect::frames_before`, and its host supplies them. After Effects and
-OpenFX check them out of the host, which can ask for any frame in any order, on any thread;
-each is held only while the core boils it down to a luma grid (and, for the swarm, cuts its
-tiles), so memory stays flat however many frames it reads. Resolume and the preview hand
-over one frame at a time, so their targets keep the recent ones. Rebuilding the background
-for every frame makes every render deterministic, as After Effects' cache needs.
+It asks for the **Background** frames before the current one (plus **Trail frames** - 1 in
+Swarm mode) through `CpuEffect::frames_before`. It keeps each frame's grid, motion and tiles
+until they age out (`src/incremental.rs`) and reads only the frames it lacks; the output is
+the same in any render order. After Effects still makes a new effect per render, so its
+cache and Multi-Frame Rendering are unchanged.
 
 The C++ effect's README covers how this differs from the live app (no state carried
 forever, per-frame IDs); all of it applies here.
@@ -92,7 +89,7 @@ runs segcam's core checks, and the effect through vfx-core's `CpuEffect` interfa
 
 - A jumping square is found where it lands and where it left.
 - A still frame never moves, and the first frame is only a reference.
-- 8, 16 and 32 bpc agree, and every frame is read once and in order.
+- 8, 16 and 32 bpc agree, and only the frames the output draws from are read.
 - Mirroring lands on the other side, and the mattes are opaque only on motion.
 - The swarm caps its pile, and the window chrome matches the bake.
 
@@ -134,16 +131,19 @@ SEGCAM_TEST_DIR=/tmp/segcam OFX_INCLUDE=/path/to/openfx/include ./effects/segcam
 
 renders a 32-frame, 320x180 moving-square sequence through the VFX Preview mini host's
 suites and compares it with the CLI in Overlay, Motion matte and Swarm, at all three
-depths, both row orders, and straight and premultiplied alpha: 36 comparisons. The host
-checks that frames come oldest first with one source image held at a time. High-depth
+depths, both row orders, and straight and premultiplied alpha, each rendered forwards,
+backwards, shuffled and cold: 144 comparisons. High-depth
 outputs are compared after rounding to 8-bit levels; this is not a native 16-bit or HDR
 precision check.
 
-The OpenFX target declares temporal access and asks for the frames segcam reads. RGBA
+The OpenFX target declares temporal access, except in DaVinci Resolve, which plays back
+far slower with it. RGBA
 images are converted to top-down ARGB, with either sign of row stride; 8-bit renders in
 u8, 16-bit (white 65535) and float render in float. The host's alpha convention is kept.
 Natron 2.5 on Windows rendered the overlay with temporal input (with the earlier
-per-effect OpenFX crate). Resolve, Nuke and macOS host validation are pending.
+per-effect OpenFX crate). Resolve 21 on Windows plays a 1080p clip at 37 renders a
+second in Overlay and 4.5 in Swarm, and it runs in Resolve 21 on macOS too. Nuke validation
+is pending.
 
 ### Resolume (FFGL)
 

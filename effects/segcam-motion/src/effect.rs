@@ -5,7 +5,8 @@
 use vfx_core::cpu::{FrameSource, ImageMut};
 use vfx_core::{Context, CpuEffect, ParamSpec, ParamValues, Unit};
 
-use crate::{Color, MotionSettings, OutputMode, RenderSettings};
+use crate::pixel::{Depth, ViewMut};
+use crate::{Advance, Color, Incremental, MotionSettings, OutputMode, RenderSettings};
 
 /// The controls, with segcam's units (percentages are 0-100), ranges and defaults
 /// (those of [`RenderSettings::default`]).
@@ -80,13 +81,20 @@ pub fn settings(p: &ParamValues, premultiplied: bool) -> RenderSettings {
     }
 }
 
-/// segcam Motion. Every render is rebuilt from the frames it's given, so it keeps no state.
+/// segcam Motion. It keeps what it works out for each frame (see [`Incremental`]), so a host
+/// that keeps the instance reads one new frame per render.
 #[derive(Default)]
-pub struct SegcamMotion;
+pub struct SegcamMotion {
+    state: Incremental,
+}
 
 impl CpuEffect for SegcamMotion {
     fn params(&self) -> &[ParamSpec] {
         PARAMS
+    }
+
+    fn keeps_state(&self) -> bool {
+        true
     }
 
     fn frames_before(&self, params: &ParamValues) -> usize {
@@ -102,11 +110,26 @@ impl CpuEffect for SegcamMotion {
         ctx: &Context,
     ) {
         let s = settings(params, ctx.premultiplied);
+        let (state, n) = (&mut self.state, ctx.frame);
         match output {
-            ImageMut::U8(mut out) => crate::render(&s, frames, count, ctx.frame, &mut out),
-            ImageMut::U16(mut out) => crate::render(&s, frames, count, ctx.frame, &mut out),
-            ImageMut::F32(mut out) => crate::render(&s, frames, count, ctx.frame, &mut out),
+            ImageMut::U8(mut out) => advance(state, &s, frames, count, n, &mut out),
+            ImageMut::U16(mut out) => advance(state, &s, frames, count, n, &mut out),
+            ImageMut::F32(mut out) => advance(state, &s, frames, count, n, &mut out),
         }
+    }
+}
+
+/// Renders through what is kept, and again from cold if the source changed.
+fn advance<C: Depth>(
+    state: &mut Incremental,
+    s: &RenderSettings,
+    frames: &mut dyn FrameSource,
+    count: usize,
+    number: i64,
+    out: &mut ViewMut<C>,
+) {
+    if state.advance(s, frames, count, number, out) == Advance::Discontinuity {
+        let _ = state.advance(s, frames, count, number, out);
     }
 }
 
@@ -145,7 +168,7 @@ mod tests {
             green: v,
             blue: v,
         };
-        let mut effect = SegcamMotion;
+        let mut effect = SegcamMotion::default();
         let mut params = ParamValues::new(PARAMS);
         params
             .set("output", vfx_core::ParamValue::Int(1))

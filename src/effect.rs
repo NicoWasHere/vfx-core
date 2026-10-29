@@ -110,8 +110,14 @@ pub trait CpuEffect: Send {
         0
     }
 
-    /// Renders the last of `count` frames into `output`. `frames` hands out each frame,
-    /// oldest first, once and in order; frames a host doesn't have come as `None`.
+    /// Whether the effect keeps what it worked out between renders. A host then keeps one
+    /// effect per instance. What it keeps must not change any frame.
+    fn keeps_state(&self) -> bool {
+        false
+    }
+
+    /// Renders the last of `count` frames into `output`. `frames` hands out the frames it
+    /// asks for; frames a host doesn't have come as `None`.
     /// `ctx.frame` is the current frame's number; the one `k` before it is `frame - k`.
     fn render(
         &mut self,

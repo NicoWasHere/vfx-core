@@ -24,6 +24,28 @@ pub unsafe extern "C" fn set_host(host: *mut OfxHost) {
     HOST.store(host, Ordering::Release);
 }
 
+/// Whether the host is DaVinci Resolve, from the name it gives itself.
+pub fn is_resolve() -> bool {
+    let host = HOST.load(Ordering::Acquire);
+    if host.is_null() {
+        return false;
+    }
+    // SAFETY: the host pointer and its property set stay valid while the plugin is loaded.
+    let props = unsafe { ((*host).fetchSuite)((*host).host, PROPERTY_SUITE.as_ptr(), 1) }
+        .cast::<PropertySuiteV1>();
+    let mut name: *mut c_char = ptr::null_mut();
+    // SAFETY: a property suite of the requested version; the name is a NUL-terminated string.
+    let named = !props.is_null()
+        && unsafe { ((*props).propGetString)((*host).host, c"OfxPropName".as_ptr(), 0, &mut name) }
+            == STAT_OK
+        && !name.is_null();
+    named
+        && unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("resolve")
+}
+
 /// Fetches the suites. Called from the load action; false if the host lacks one.
 pub fn load() -> bool {
     let host = HOST.load(Ordering::Acquire);

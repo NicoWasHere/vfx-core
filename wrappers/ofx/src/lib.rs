@@ -15,7 +15,6 @@ mod cpu;
 mod params;
 
 use std::ffi::{CStr, c_char, c_void};
-use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
@@ -108,10 +107,17 @@ fn dispatch(
         } else {
             STAT_ERR_MISSING_HOST_FEATURE
         }
-    } else if action == ACTION_UNLOAD
-        || action == ACTION_CREATE_INSTANCE
-        || action == ACTION_DESTROY_INSTANCE
-    {
+    } else if action == ACTION_UNLOAD {
+        STAT_OK
+    } else if action == ACTION_CREATE_INSTANCE {
+        if cpu {
+            create_instance(effect)?;
+        }
+        STAT_OK
+    } else if action == ACTION_DESTROY_INSTANCE {
+        if cpu {
+            destroy_instance(effect)?;
+        }
         STAT_OK
     } else if action == ACTION_DESCRIBE {
         describe(effect)?;
@@ -184,16 +190,22 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
     optional(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
     optional(
         PROP_TEMPORAL_CLIP_ACCESS,
-        p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, i32::from(cpu)),
+        p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, i32::from(temporal(cpu))),
     );
     optional(
         PROP_MULTIPLE_CLIP_DEPTHS,
         p.set_int(PROP_MULTIPLE_CLIP_DEPTHS, 0, 0),
     );
-    // Each render makes or leases its own instance, so concurrent renders are safe.
+    // Each render makes or leases its own instance, so concurrent renders are safe. An effect
+    // that keeps state has one per instance, so its renders take turns.
+    let safety = if keeps_state() {
+        RENDER_INSTANCE_SAFE
+    } else {
+        RENDER_FULLY_SAFE
+    };
     optional(
         PROP_RENDER_THREAD_SAFETY,
-        p.set_str(PROP_RENDER_THREAD_SAFETY, 0, RENDER_FULLY_SAFE),
+        p.set_str(PROP_RENDER_THREAD_SAFETY, 0, safety),
     );
     optional(
         PROP_HOST_FRAME_THREADING,
@@ -236,7 +248,12 @@ fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxSta
     let plugin = vfx_host::plugin();
     let general = in_args.str_is(PROP_CONTEXT, CONTEXT_GENERAL)?;
     let layer = has_layer_clip(general);
-    define_clip(effect, CLIP_SOURCE, false, plugin.kind == Kind::Cpu)?;
+    define_clip(
+        effect,
+        CLIP_SOURCE,
+        false,
+        temporal(plugin.kind == Kind::Cpu),
+    )?;
     if layer {
         define_clip(effect, CLIP_LAYER, true, false)?;
     }
@@ -495,7 +512,7 @@ fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
 
 /// Hands a CPU effect the source frames it reads, oldest first, each fetched and
 /// converted when asked for and released straight after.
-struct Source<C> {
+struct Source<'a, C> {
     clip: Clip,
     /// The clip's first frame; earlier ones don't exist.
     start: f64,
@@ -503,10 +520,11 @@ struct Source<C> {
     first: f64,
     canvas: Rect,
     error: Option<OfxStatus>,
-    _depth: PhantomData<C>,
+    /// Where each frame is decoded.
+    frame: &'a mut Vec<Argb<C>>,
 }
 
-impl<C: CpuDepth> FrameSource for Source<C> {
+impl<C: CpuDepth> FrameSource for Source<'_, C> {
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>)) {
         let time = self.first + index as f64;
         if time < self.start {
@@ -516,9 +534,9 @@ impl<C: CpuDepth> FrameSource for Source<C> {
         match fetch(self.clip, time) {
             Ok(Some(frame)) => {
                 // SAFETY: the fetched image stays alive through the closure.
-                let pixels = unsafe { cpu::decode::<C>(&frame.image, self.canvas) };
+                unsafe { cpu::decode_into(&frame.image, self.canvas, self.frame) };
                 let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
-                f(Some(C::image(View::from_pixels(&pixels, w, h))));
+                f(Some(C::image(View::from_pixels(self.frame, w, h))));
             }
             Ok(None) => {
                 self.error.get_or_insert(STAT_FAILED);
@@ -532,11 +550,82 @@ impl<C: CpuDepth> FrameSource for Source<C> {
     }
 }
 
+/// Whether to declare temporal clip access. Resolve hands over earlier frames without it and
+/// plays back far slower with it.
+fn temporal(cpu: bool) -> bool {
+    cpu && !host::is_resolve()
+}
+
+fn keeps_state() -> bool {
+    matches!((vfx_host::plugin().make)(), Processor::Cpu(e) if e.keeps_state())
+}
+
+/// An instance's own CPU effect, for effects that keep state.
+type Kept = std::sync::Mutex<Box<dyn vfx_core::CpuEffect>>;
+
+fn create_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
+    let Processor::Cpu(cpu_effect) = (vfx_host::plugin().make)() else {
+        return Ok(());
+    };
+    if !cpu_effect.keeps_state() {
+        return Ok(());
+    }
+    let kept: *mut Kept = Box::into_raw(Box::new(std::sync::Mutex::new(cpu_effect)));
+    // SAFETY: an instance handle; the pointer is freed in destroy-instance.
+    check(unsafe {
+        (suites().prop.propSetPointer)(
+            effect_props(effect)?.0,
+            PROP_INSTANCE_DATA.as_ptr(),
+            0,
+            kept.cast(),
+        )
+    })
+}
+
+fn destroy_instance(effect: ImageEffect) -> Result<(), OfxStatus> {
+    let props = effect_props(effect)?;
+    let kept = props
+        .get_pointer(PROP_INSTANCE_DATA)
+        .unwrap_or(ptr::null_mut());
+    if !kept.is_null() {
+        // SAFETY: an instance handle; the pointer is cleared before what it points at is freed.
+        check(unsafe {
+            (suites().prop.propSetPointer)(props.0, PROP_INSTANCE_DATA.as_ptr(), 0, ptr::null_mut())
+        })?;
+        // SAFETY: the Box from create-instance, freed once.
+        drop(unsafe { Box::from_raw(kept.cast::<Kept>()) });
+    }
+    Ok(())
+}
+
 fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
-    let plugin = vfx_host::plugin();
-    let Processor::Cpu(mut cpu_effect) = (plugin.make)() else {
+    let kept = effect_props(effect)?
+        .get_pointer(PROP_INSTANCE_DATA)
+        .unwrap_or(ptr::null_mut());
+    // SAFETY: set from a Box in create-instance and freed only in destroy-instance.
+    if let Some(kept) = unsafe { kept.cast::<Kept>().as_ref() } {
+        // A render that panicked can leave the effect half updated, so start over.
+        let mut cpu_effect = kept.lock().unwrap_or_else(|poisoned| {
+            kept.clear_poison();
+            let mut cpu_effect = poisoned.into_inner();
+            if let Processor::Cpu(fresh) = (vfx_host::plugin().make)() {
+                *cpu_effect = fresh;
+            }
+            cpu_effect
+        });
+        return render_cpu_with(&mut **cpu_effect, effect, in_args);
+    }
+    let Processor::Cpu(mut cpu_effect) = (vfx_host::plugin().make)() else {
         return Err(STAT_FAILED);
     };
+    render_cpu_with(&mut *cpu_effect, effect, in_args)
+}
+
+fn render_cpu_with(
+    cpu_effect: &mut dyn vfx_core::CpuEffect,
+    effect: ImageEffect,
+    in_args: Props,
+) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
     let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
     let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
@@ -590,8 +679,41 @@ fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     error.map_or(Ok(()), Err)
 }
 
+/// Buffers kept on each rendering thread, so a render allocates no frame-sized memory. A render
+/// takes them out while it runs, so one nested inside it on the same thread starts empty.
+trait Scratch: CpuDepth {
+    fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<Self>>, &mut Vec<Argb<Self>>) -> R) -> R;
+}
+
+thread_local! {
+    static BYTES: std::cell::RefCell<[Vec<Argb<u8>>; 2]> = const {
+        std::cell::RefCell::new([Vec::new(), Vec::new()])
+    };
+    static FLOATS: std::cell::RefCell<[Vec<Argb<f32>>; 2]> = const {
+        std::cell::RefCell::new([Vec::new(), Vec::new()])
+    };
+}
+
+impl Scratch for u8 {
+    fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<u8>>, &mut Vec<Argb<u8>>) -> R) -> R {
+        let [mut a, mut b] = BYTES.take();
+        let result = f(&mut a, &mut b);
+        BYTES.set([a, b]);
+        result
+    }
+}
+
+impl Scratch for f32 {
+    fn with_scratch<R>(f: impl FnOnce(&mut Vec<Argb<f32>>, &mut Vec<Argb<f32>>) -> R) -> R {
+        let [mut a, mut b] = FLOATS.take();
+        let result = f(&mut a, &mut b);
+        FLOATS.set([a, b]);
+        result
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn draw<C: CpuDepth>(
+fn draw<C: Scratch>(
     effect: &mut dyn vfx_core::CpuEffect,
     clip: Clip,
     start: f64,
@@ -603,19 +725,22 @@ fn draw<C: CpuDepth>(
     output: &Image,
     window: Rect,
 ) -> Option<OfxStatus> {
-    let mut frames = Source::<C> {
-        clip,
-        start,
-        first,
-        canvas,
-        error: None,
-        _depth: PhantomData,
-    };
-    let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-    let mut pixels = vec![Argb::<C>::default(); canvas.width() * canvas.height()];
-    let view = C::image_mut(ViewMut::from_pixels(&mut pixels, w, h));
-    effect.render(&mut frames, count, view, values, ctx);
-    // SAFETY: the render window is clipped to the output and canvas bounds.
-    unsafe { cpu::encode(&pixels, canvas, output, window) };
-    frames.error
+    C::with_scratch(|frame, pixels| {
+        let mut frames = Source::<C> {
+            clip,
+            start,
+            first,
+            canvas,
+            error: None,
+            frame,
+        };
+        let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+        pixels.clear();
+        pixels.resize(canvas.width() * canvas.height(), Argb::default());
+        let view = C::image_mut(ViewMut::from_pixels(pixels, w, h));
+        effect.render(&mut frames, count, view, values, ctx);
+        // SAFETY: the render window is clipped to the output and canvas bounds.
+        unsafe { cpu::encode(pixels, canvas, output, window) };
+        frames.error
+    })
 }

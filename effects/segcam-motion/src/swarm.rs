@@ -4,8 +4,6 @@
 //! real one (`chrome.rs`). The title bar is laid out at 1x and sampled up or down for other
 //! canvas sizes.
 
-use std::collections::VecDeque;
-
 use crate::chrome::{self, Glyph};
 use crate::font;
 use crate::motion::Blob;
@@ -529,13 +527,42 @@ pub fn draw_window<C: Channel>(
     shadow: &ShadowKernel,
     straight_alpha: bool,
 ) {
+    let bar = TitleBar::new(tile, m);
+    draw_window_with(out, tile, &bar, m, shadow, straight_alpha);
+}
+
+/// A tile's title bar, made once and shared by every band of rows.
+pub struct TitleBar {
+    width: i32,
+    pixels: Vec<Color>,
+}
+
+impl TitleBar {
+    pub fn new(tile: &Tile, m: &SwarmMetrics) -> Self {
+        let frame = tile_extent(tile.video, m.title_height);
+        let width = 1.max((f64::from(frame.w) / m.scale).round() as i32);
+        Self {
+            width,
+            pixels: render_title_bar(width, &tile.title),
+        }
+    }
+}
+
+/// [`draw_window`] with its title bar already made.
+pub fn draw_window_with<C: Channel>(
+    out: &mut ViewMut<C>,
+    tile: &Tile,
+    bar: &TitleBar,
+    m: &SwarmMetrics,
+    shadow: &ShadowKernel,
+    straight_alpha: bool,
+) {
     let frame = tile_extent(tile.video, m.title_height);
     let radius = f64::from(chrome::CORNER_RADIUS) * m.scale;
     let bar_h = chrome::TITLE_BAR_HEIGHT;
 
     // The title bar at 1x, sampled at the canvas's scale.
-    let bar_w = 1.max((f64::from(frame.w) / m.scale).round() as i32);
-    let bar = render_title_bar(bar_w, &tile.title);
+    let (bar_w, bar) = (bar.width, &bar.pixels);
     let sample_bar = |fx: f64, fy: f64| {
         let fx = (fx - 0.5).max(0.0).min(f64::from(bar_w) - 1.0);
         let fy = (fy - 0.5).max(0.0).min(f64::from(bar_h) - 1.0);
@@ -557,7 +584,7 @@ pub fn draw_window<C: Channel>(
             frame.w + 2 * reach,
             frame.h + 2 * reach,
         ),
-        PixelRect::new(0, 0, out.width, out.height),
+        PixelRect::new(0, out.rows().start, out.width, out.rows().len() as i32),
     );
     if area.is_empty() {
         return;
@@ -655,16 +682,40 @@ pub fn draw_window<C: Channel>(
     }
 }
 
-/// Clear, then the pile oldest to newest, each tile the window segcam would have made for it.
-pub fn draw_swarm<C: Channel>(out: &mut ViewMut<C>, tiles: &VecDeque<Tile>, straight_alpha: bool) {
+/// Clears the canvas, then draws each shown tile oldest first as segcam's window. Bands of
+/// rows are drawn on a few threads, each band drawing every window in order.
+pub fn draw_swarm<'t, C: Channel>(
+    out: &mut ViewMut<C>,
+    tiles: impl IntoIterator<Item = &'t Tile>,
+    straight_alpha: bool,
+) {
+    // More threads only compete with the host's own render threads.
+    const THREADS: usize = 6;
+    const BANDS_PER_THREAD: usize = 4;
     let m = SwarmMetrics::new(out.height);
     let shadow = ShadowKernel::new(m.scale);
-    fill_rect(
-        out,
-        PixelRect::new(0, 0, out.width, out.height),
-        Argb::default(),
-    );
-    for tile in tiles.iter().filter(|t| !t.hidden) {
-        draw_window(out, tile, &m, &shadow, straight_alpha);
-    }
+    let windows: Vec<(&Tile, TitleBar)> = tiles
+        .into_iter()
+        .map(|t| (t, TitleBar::new(t, &m)))
+        .collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(THREADS);
+    let count = (threads * BANDS_PER_THREAD).min((out.height / 32).max(1) as usize);
+    let bands = std::sync::Mutex::new(out.bands(count));
+    let next = || bands.lock().ok().and_then(|mut bands| bands.pop());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (next, windows, m, shadow) = (&next, &windows, &m, &shadow);
+            scope.spawn(move || {
+                while let Some(mut band) = next() {
+                    let all = PixelRect::new(0, 0, band.width, band.height);
+                    fill_rect(&mut band, all, Argb::default());
+                    for (tile, bar) in windows {
+                        draw_window_with(&mut band, tile, bar, m, shadow, straight_alpha);
+                    }
+                }
+            });
+        }
+    });
 }
