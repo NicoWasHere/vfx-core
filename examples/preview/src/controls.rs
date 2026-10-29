@@ -63,6 +63,8 @@ pub struct Controls {
     /// Frames a window stays up.
     pub segcam_live_lifetime: f32,
     pub segcam_live_max_tiles: usize,
+    /// Windows show the video playing where they are, not a snapshot of when they opened.
+    pub segcam_live_video: bool,
 }
 
 impl Default for Controls {
@@ -110,6 +112,7 @@ impl Default for Controls {
             segcam_live_max_segments: 16,
             segcam_live_lifetime: 60.0,
             segcam_live_max_tiles: 100,
+            segcam_live_video: false,
         }
     }
 }
@@ -380,6 +383,13 @@ pub fn panel(
 
         #[cfg(not(target_arch = "wasm32"))]
         section(ui, "Segcam live", Some(&mut c.segcam_live_on), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Windows show");
+                ui.radio_value(&mut c.segcam_live_video, false, "Snapshot")
+                    .on_hover_text("The moment each window opened, frozen");
+                ui.radio_value(&mut c.segcam_live_video, true, "Live video")
+                    .on_hover_text("The video playing behind each window, as if cut out of it");
+            });
             param(
                 ui,
                 &mut c.segcam_live_sensitivity,

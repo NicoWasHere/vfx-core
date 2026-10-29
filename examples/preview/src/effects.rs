@@ -461,7 +461,8 @@ impl Effects {
         let source = match crate::segcam_live::settings(controls) {
             Some(s) if self.image.is_some() && self.live.started() => {
                 self.live.expire(&s);
-                self.live.draw(gpu, &mut encoder, &self.frames.swarm);
+                self.live
+                    .draw(gpu, &mut encoder, &self.frames.swarm, s.live_video);
                 &self.frames.swarm
             }
             _ => source,

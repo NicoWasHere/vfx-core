@@ -36,6 +36,8 @@ pub struct Settings {
     /// Frames a window stays up.
     pub lifetime: u32,
     pub max_tiles: usize,
+    /// Windows show the video now, where they are, instead of a snapshot.
+    pub live_video: bool,
 }
 
 /// segcam-live's settings from the panel, or None while it's switched off.
@@ -51,6 +53,7 @@ pub fn settings(c: &Controls) -> Option<Settings> {
         grid_width: segcam_motion::RenderSettings::default().grid_width,
         lifetime: c.segcam_live_lifetime.max(1.0).round() as u32,
         max_tiles: c.segcam_live_max_tiles,
+        live_video: c.segcam_live_video,
     })
 }
 
@@ -77,6 +80,8 @@ struct W {
 @group(0) @binding(0) var<uniform> u: W;
 @group(0) @binding(1) var picture: texture_2d<f32>;
 @group(0) @binding(2) var bar: texture_2d<f32>;
+// The video's current frame, for live windows.
+@group(0) @binding(3) var source: texture_2d<f32>;
 
 // The instance index is the window's place in the pile, oldest 0: newer is nearer.
 fn place(p: vec2<f32>, pile: u32) -> vec4<f32> {
@@ -138,25 +143,41 @@ fn sample_bar(fx: f32, fy: f32) -> vec3<f32> {
     return mix(top, bottom, t.y);
 }
 
-// The window's own pixel at `c`: its title bar, or its picture.
-fn window_colour(c: vec2<f32>, l: vec2<f32>) -> vec3<f32> {
+// The window's own pixel at `c`: its title bar, or its picture: the snapshot taken when
+// it opened, or (`live`) the video playing at that spot now, as if the window were a
+// hole cut in the picture.
+fn window_colour(c: vec2<f32>, l: vec2<f32>, live: bool) -> vec3<f32> {
     let title = u.canvas.z;
     if l.y < title {
         return sample_bar((l.x + 0.5) / u.canvas.w, (l.y + 0.5) * u.sizes.w / title);
     }
-    // segcam-motion's crop: the segment's box stretched over the (maybe grown) tile.
-    let t = floor(c - u.video.xy);
-    let s = min(u.sizes.xy - 1.0, floor((t + 0.5) * u.sizes.xy / u.video.zw));
-    var col = textureLoad(picture, vec2<i32>(max(s, vec2(0.0))), 0).rgb;
+    var col: vec3<f32>;
+    if live {
+        col = textureLoad(source, vec2<i32>(c), 0).rgb;
+    } else {
+        // segcam-motion's crop: the segment's box stretched over the (maybe grown) tile.
+        let t = floor(c - u.video.xy);
+        let s = min(u.sizes.xy - 1.0, floor((t + 0.5) * u.sizes.xy / u.video.zw));
+        col = textureLoad(picture, vec2<i32>(max(s, vec2(0.0))), 0).rgb;
+    }
     if l.y - title < 1.0 {
         col = col * BAR_EDGE_SHADE;
     }
     return col;
 }
 
+fn solid(pos: vec4<f32>, live: bool) -> vec4<f32> {
+    return vec4<f32>(window_colour(pos.xy, floor(pos.xy - u.frame.xy), live), 1.0);
+}
+
 @fragment
 fn fs_solid(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    return vec4<f32>(window_colour(pos.xy, floor(pos.xy - u.frame.xy)), 1.0);
+    return solid(pos, false);
+}
+
+@fragment
+fn fs_solid_live(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return solid(pos, true);
 }
 
 // segcam-motion's mask_coverage: the rounded window shape, antialiased.
@@ -168,6 +189,15 @@ fn coverage(l: vec2<f32>, size: vec2<f32>, r: f32) -> f32 {
 
 @fragment
 fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return soft(pos, false);
+}
+
+@fragment
+fn fs_live(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return soft(pos, true);
+}
+
+fn soft(pos: vec4<f32>, live: bool) -> vec4<f32> {
     let c = pos.xy;
     let f = u.frame;
     let sigma = u.shadow.x;
@@ -179,7 +209,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     var cov = 0.0;
     let l = floor(c - f.xy);
     if l.x >= 0.0 && l.y >= 0.0 && l.x < f.z && l.y < f.w {
-        col = window_colour(c, l);
+        col = window_colour(c, l, live);
         cov = coverage(l, f.zw, radius);
         // Fully inside, the window hides its own shadow: most pixels stop here.
         if cov >= 1.0 {
@@ -420,6 +450,9 @@ struct Passes {
     window: Pass,
     /// The windows' solid insides, opaque, writing depth. Shares `window`'s bind groups.
     solid: Pass,
+    /// The same two for windows showing live video.
+    window_live: Pass,
+    solid_live: Pass,
     crop: Pass,
     copy: Pass,
 }
@@ -434,27 +467,35 @@ impl Passes {
             stencil: Default::default(),
             bias: Default::default(),
         };
-        Self {
-            window: Pass::with(
+        let soft = |fs| {
+            Pass::with(
                 d,
                 WINDOW_WGSL,
                 true,
-                2,
+                3,
                 CANVAS_FORMAT,
                 Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 Some(depth(false)),
-                ("vs", "fs"),
-            ),
-            solid: Pass::with(
+                ("vs", fs),
+            )
+        };
+        let solid = |fs| {
+            Pass::with(
                 d,
                 WINDOW_WGSL,
                 true,
-                2,
+                3,
                 CANVAS_FORMAT,
                 None,
                 Some(depth(true)),
-                ("vs_solid", "fs_solid"),
-            ),
+                ("vs_solid", fs),
+            )
+        };
+        Self {
+            window: soft("fs"),
+            solid: solid("fs_solid"),
+            window_live: soft("fs_live"),
+            solid_live: solid("fs_solid_live"),
             crop: Pass::new(d, CROP_WGSL, true, 1, PICTURE_FORMAT, None),
             copy: Pass::new(d, COPY_WGSL, false, 1, FRAME_FORMAT, None),
         }
@@ -613,6 +654,7 @@ impl Live {
                         uniform(gpu, &values).as_entire_binding(),
                         wgpu::BindingResource::TextureView(&picture),
                         wgpu::BindingResource::TextureView(&bar.create_view(&Default::default())),
+                        wgpu::BindingResource::TextureView(&source.view),
                     ],
                 );
                 self.windows.push_back(Window {
@@ -644,8 +686,15 @@ impl Live {
         self.windows.len()
     }
 
-    /// Draws the pile over a clear background into `target`, as if oldest first.
-    pub fn draw(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &Frame) {
+    /// Draws the pile over a clear background into `target`, as if oldest first. With
+    /// `live_video`, windows show the source's current frame instead of their snapshots.
+    pub fn draw(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Frame,
+        live_video: bool,
+    ) {
         let passes = self.passes.get_or_insert_with(|| Passes::new(gpu));
         let size = (target.width, target.height);
         let canvas = self.canvas.get_or_insert_with(|| {
@@ -678,15 +727,20 @@ impl Live {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let (solid, soft) = if live_video {
+                (&passes.solid_live, &passes.window_live)
+            } else {
+                (&passes.solid, &passes.window)
+            };
             // Solid insides newest first, so each pixel is painted by the window on top.
-            pass.set_pipeline(&passes.solid.pipeline);
+            pass.set_pipeline(&solid.pipeline);
             for (pile, window) in self.windows.iter().enumerate().rev() {
                 let pile = pile as u32;
                 pass.set_bind_group(0, &window.bind, &[]);
                 pass.draw(0..12, pile..pile + 1);
             }
             // Soft parts oldest first, blended, wherever no newer window's inside is.
-            pass.set_pipeline(&passes.window.pipeline);
+            pass.set_pipeline(&soft.pipeline);
             for (pile, window) in self.windows.iter().enumerate() {
                 let pile = pile as u32;
                 pass.set_bind_group(0, &window.bind, &[]);
@@ -800,6 +854,7 @@ mod tests {
             grid_width: 192,
             lifetime,
             max_tiles,
+            live_video: false,
         }
     }
 
@@ -826,10 +881,10 @@ mod tests {
             self.live.push(&self.gpu, &self.source, &pixels, s);
         }
 
-        fn draw(&mut self) -> Vec<f32> {
+        fn draw(&mut self, live_video: bool) -> Vec<f32> {
             let out = Frame::new(&self.gpu, SIZE.0, SIZE.1, FRAME_FORMAT);
             let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
-            self.live.draw(&self.gpu, &mut encoder, &out);
+            self.live.draw(&self.gpu, &mut encoder, &out, live_video);
             self.gpu.queue.submit(Some(encoder.finish()));
             vfx_core::Readback::new(&self.gpu, &out).read_f32(&self.gpu, &out)
         }
@@ -855,6 +910,36 @@ mod tests {
         assert_eq!(rig.live.len(), 0, "every window has expired");
     }
 
+    /// Live windows show whatever the video shows now at their spot; snapshots keep the
+    /// moment they opened.
+    #[test]
+    fn live_windows_show_the_video_now() {
+        let s = settings(1000, 1000);
+        let mut rig = Rig::new();
+        for i in 0..8 {
+            rig.push(Some(12 * i), &s);
+        }
+        assert!(rig.live.len() > 0);
+        // The video moves on to a blue frame, with no new windows.
+        let blue: Vec<f32> = (0..SIZE.0 * SIZE.1)
+            .flat_map(|_| [0.0, 0.0, 1.0, 1.0])
+            .collect();
+        rig.source.write(&rig.gpu, bytemuck::cast_slice(&blue));
+        let blue_pixels = |pixels: &[f32]| {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[2] > 0.99 && p[0] < 0.01 && p[3] > 0.99)
+                .count()
+        };
+        assert!(
+            blue_pixels(&rig.draw(true)) > 100,
+            "live windows show the blue frame"
+        );
+        assert_eq!(blue_pixels(&rig.draw(false)), 0, "snapshots don't");
+    }
+
     #[test]
     fn max_tiles_drops_the_oldest() {
         let s = settings(1000, 2);
@@ -877,7 +962,7 @@ mod tests {
             rig.push(Some(12 * i), &s);
         }
         assert!(rig.live.len() > 2, "several windows overlap");
-        let gpu_pixels = rig.draw();
+        let gpu_pixels = rig.draw(false);
 
         let (w, h) = (SIZE.0 as i32, SIZE.1 as i32);
         let tiles: VecDeque<swarm::Tile> = rig
@@ -946,7 +1031,7 @@ mod tests {
             let pushed = t.elapsed();
             let t = Instant::now();
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            live.draw(&gpu, &mut encoder, &target);
+            live.draw(&gpu, &mut encoder, &target, false);
             gpu.queue.submit(Some(encoder.finish()));
             wait();
             if i >= 60 {
@@ -965,7 +1050,7 @@ mod tests {
         let t = Instant::now();
         for _ in 0..30 {
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            live.draw(&gpu, &mut encoder, &target);
+            live.draw(&gpu, &mut encoder, &target, false);
             gpu.queue.submit(Some(encoder.finish()));
             wait();
         }
