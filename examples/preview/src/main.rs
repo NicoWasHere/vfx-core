@@ -86,6 +86,8 @@ struct Media {
     scrub: Option<Scrub>,
     /// Frames on their way to the GPU, through segcam when it's on.
     segcam: segcam::Worker,
+    /// When each of the last second's video frames reached the screen.
+    shown: std::collections::VecDeque<Instant>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -259,6 +261,7 @@ impl Preview {
                 let segcam = segcam::Worker::start(video.info.size);
                 self.media = Some(Media {
                     segcam,
+                    shown: Default::default(),
                     sound: self
                         .sound_on
                         .then(|| video::Sound::play(&video.info, 0.0))
@@ -365,7 +368,8 @@ impl Preview {
         let controls = self.exprs.apply(&self.controls, &self.sources, dt as f32);
         self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(media) = &self.media {
+        if let Some(media) = &mut self.media {
+            let mut new_frame = false;
             // segcam-live takes over from segcam motion while it's on: frames go straight
             // to the GPU, which draws its windows.
             let live = segcam_live::settings(&controls);
@@ -373,6 +377,7 @@ impl Preview {
                 if let Some(s) = &live {
                     self.effects.write_source(&self.gpu, &pixels);
                     self.effects.push_live(&self.gpu, &pixels, s);
+                    new_frame = true;
                 }
                 media.segcam.push(pixels);
             }
@@ -385,6 +390,18 @@ impl Preview {
                 && live.is_none()
             {
                 self.effects.write_source(&self.gpu, &pixels);
+                new_frame = true;
+            }
+            let now = Instant::now();
+            if new_frame {
+                media.shown.push_back(now);
+            }
+            while media
+                .shown
+                .front()
+                .is_some_and(|t| now.duration_since(*t).as_secs_f64() > 1.0)
+            {
+                media.shown.pop_front();
             }
         }
         self.effects.render(&self.gpu, &controls, self.time, false);
@@ -525,6 +542,13 @@ impl Preview {
             self.cameras.as_slice(),
             self.tracker.is_some(),
         );
+        // Video frames that reached the screen in the last second, against the source's
+        // own rate.
+        #[cfg(not(target_arch = "wasm32"))]
+        let video_fps = self
+            .media
+            .as_ref()
+            .map(|m| (m.shown.len() as f32, m.video.info.fps as f32));
         #[cfg(not(target_arch = "wasm32"))]
         let playback = self
             .media
@@ -542,10 +566,11 @@ impl Preview {
                     .map_or_else(|| m.video.playing(), |s| s.resume),
             });
         #[cfg(target_arch = "wasm32")]
-        let (video, sound_on, export, cameras, face_tracking, playback) =
-            (false, false, None, &[][..], false, None);
+        let (video, sound_on, export, cameras, face_tracking, playback, video_fps) =
+            (false, false, None, &[][..], false, None, None);
         let status = Status {
             fps: self.fps,
+            video_fps,
             size: image_size,
             image: self.effects.image_name(),
             message: self.message.as_deref(),

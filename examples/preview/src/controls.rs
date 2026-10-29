@@ -180,7 +180,10 @@ pub struct Playback {
 
 /// Status shown at the top of the panel.
 pub struct Status<'a> {
+    /// How often the window redraws.
     pub fps: f32,
+    /// Video frames shown in the last second, and the video's own rate.
+    pub video_fps: Option<(f32, f32)>,
     pub size: (u32, u32),
     pub image: Option<&'a str>,
     pub message: Option<&'a str>,
@@ -274,11 +277,14 @@ pub fn panel(
     ui.heading("VFX Preview");
     ui.label(
         RichText::new(format!(
-            "{} × {}   {:.0} fps",
+            "{} × {}   window {:.0} fps",
             status.size.0, status.size.1, status.fps
         ))
         .weak(),
     );
+    if let Some((shown, rate)) = status.video_fps {
+        ui.label(RichText::new(format!("video {shown:.0} of {rate:.0} fps")).weak());
+    }
     if let Some(message) = status.message {
         ui.colored_label(Color32::from_rgb(230, 120, 90), message);
     }

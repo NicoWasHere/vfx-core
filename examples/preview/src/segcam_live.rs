@@ -6,9 +6,13 @@
 //! forward, so this keeps the pile instead: each frame is segmented once (on the CPU, from
 //! a small luma grid) against the frames before it, and its moving regions become new
 //! windows on top. Each window's picture is copied out of the frame on the GPU when it's
-//! made, and its title bar drawn once by segcam-motion; every frame, one pass draws the
-//! pile, shadows and rounded corners worked out in the shader. Windows expire after
-//! `lifetime` frames, or oldest first past `max_tiles`.
+//! made, and its title bar drawn once by segcam-motion. Every frame the pile is drawn
+//! with each pixel painted about once, however deep it is: first the windows' solid
+//! insides, newest first, each leaving its place in the pile in a depth buffer so the
+//! GPU skips whatever a newer window already covers; then their soft parts (rounded
+//! corners, edges and shadows), oldest first and blended, again only where no newer
+//! window's inside is on top. Windows expire after `lifetime` frames, or oldest first
+//! past `max_tiles`.
 //!
 //! Detection, crops, titles and title bars are segcam-motion's own. The shadow is a close
 //! match rather than an exact one: its rounded corners are approximated.
@@ -55,6 +59,8 @@ pub fn settings(c: &Controls) -> Option<Settings> {
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Window pictures and title bars.
 const PICTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Each window's place in the pile, so newer windows hide older ones before they're drawn.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 // The two constants are from segcam-motion's chrome.rs, which is private to it.
 const WINDOW_WGSL: &str = r#"
@@ -72,16 +78,40 @@ struct W {
 @group(0) @binding(1) var picture: texture_2d<f32>;
 @group(0) @binding(2) var bar: texture_2d<f32>;
 
+// The instance index is the window's place in the pile, oldest 0: newer is nearer.
+fn place(p: vec2<f32>, pile: u32) -> vec4<f32> {
+    let depth = 1.0 - f32(pile + 1u) / 65536.0;
+    return vec4<f32>(p.x / u.canvas.x * 2.0 - 1.0, 1.0 - p.y / u.canvas.y * 2.0, depth, 1.0);
+}
+
+var<private> QUAD: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
+    vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+    vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+
+// The soft parts: the whole window and its shadow.
 @vertex
-fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
-    var corners = array<vec2<f32>, 6>(
-        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
-        vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) pile: u32)
+    -> @builtin(position) vec4<f32> {
     let reach = u.shadow.w;
     let lo = u.frame.xy - vec2(reach);
     let hi = u.frame.xy + u.frame.zw + vec2(reach);
-    let p = mix(lo, hi, corners[i]);
-    return vec4<f32>(p.x / u.canvas.x * 2.0 - 1.0, 1.0 - p.y / u.canvas.y * 2.0, 0.0, 1.0);
+    return place(mix(lo, hi, QUAD[i % 6u]), pile);
+}
+
+// The solid inside: two rects that together cover everything but the rounded corners,
+// where every pixel is fully the window's.
+@vertex
+fn vs_solid(@builtin(vertex_index) i: u32, @builtin(instance_index) pile: u32)
+    -> @builtin(position) vec4<f32> {
+    let f = u.frame;
+    let r = u.shadow.z;
+    var lo = f.xy + vec2(0.0, r);
+    var hi = f.xy + f.zw - vec2(0.0, r);
+    if i >= 6u {
+        lo = f.xy + vec2(r, 0.0);
+        hi = f.xy + f.zw - vec2(r, 0.0);
+    }
+    return place(mix(lo, hi, QUAD[i % 6u]), pile);
 }
 
 // Abramowitz and Stegun 7.1.26, within 1.5e-7.
@@ -108,6 +138,27 @@ fn sample_bar(fx: f32, fy: f32) -> vec3<f32> {
     return mix(top, bottom, t.y);
 }
 
+// The window's own pixel at `c`: its title bar, or its picture.
+fn window_colour(c: vec2<f32>, l: vec2<f32>) -> vec3<f32> {
+    let title = u.canvas.z;
+    if l.y < title {
+        return sample_bar((l.x + 0.5) / u.canvas.w, (l.y + 0.5) * u.sizes.w / title);
+    }
+    // segcam-motion's crop: the segment's box stretched over the (maybe grown) tile.
+    let t = floor(c - u.video.xy);
+    let s = min(u.sizes.xy - 1.0, floor((t + 0.5) * u.sizes.xy / u.video.zw));
+    var col = textureLoad(picture, vec2<i32>(max(s, vec2(0.0))), 0).rgb;
+    if l.y - title < 1.0 {
+        col = col * BAR_EDGE_SHADE;
+    }
+    return col;
+}
+
+@fragment
+fn fs_solid(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(window_colour(pos.xy, floor(pos.xy - u.frame.xy)), 1.0);
+}
+
 // segcam-motion's mask_coverage: the rounded window shape, antialiased.
 fn coverage(l: vec2<f32>, size: vec2<f32>, r: f32) -> f32 {
     let c = l + 0.5;
@@ -128,18 +179,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     var cov = 0.0;
     let l = floor(c - f.xy);
     if l.x >= 0.0 && l.y >= 0.0 && l.x < f.z && l.y < f.w {
-        let title = u.canvas.z;
-        if l.y < title {
-            col = sample_bar((l.x + 0.5) / u.canvas.w, (l.y + 0.5) * u.sizes.w / title);
-        } else {
-            // segcam-motion's crop: the segment's box stretched over the (maybe grown) tile.
-            let t = floor(c - u.video.xy);
-            let s = min(u.sizes.xy - 1.0, floor((t + 0.5) * u.sizes.xy / u.video.zw));
-            col = textureLoad(picture, vec2<i32>(max(s, vec2(0.0))), 0).rgb;
-            if l.y - title < 1.0 {
-                col = col * BAR_EDGE_SHADE;
-            }
-        }
+        col = window_colour(c, l);
         cov = coverage(l, f.zw, radius);
         // Fully inside, the window hides its own shadow: most pixels stop here.
         if cov >= 1.0 {
@@ -215,6 +255,29 @@ impl Pass {
         format: wgpu::TextureFormat,
         blend: Option<wgpu::BlendState>,
     ) -> Self {
+        Self::with(
+            device,
+            wgsl,
+            uniform,
+            textures,
+            format,
+            blend,
+            None,
+            ("vs", "fs"),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with(
+        device: &wgpu::Device,
+        wgsl: &str,
+        uniform: bool,
+        textures: u32,
+        format: wgpu::TextureFormat,
+        blend: Option<wgpu::BlendState>,
+        depth: Option<wgpu::DepthStencilState>,
+        (vs, fs): (&str, &str),
+    ) -> Self {
         let mut entries = Vec::new();
         if uniform {
             entries.push(wgpu::BindGroupLayoutEntry {
@@ -258,16 +321,16 @@ impl Pass {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &module,
-                entry_point: Some("vs"),
+                entry_point: Some(vs),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: depth,
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &module,
-                entry_point: Some("fs"),
+                entry_point: Some(fs),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -353,7 +416,10 @@ fn texture(gpu: &Gpu, (w, h): (u32, u32), format: wgpu::TextureFormat) -> wgpu::
 }
 
 struct Passes {
+    /// The windows' soft parts, blended; tested against the solid insides' depth.
     window: Pass,
+    /// The windows' solid insides, opaque, writing depth. Shares `window`'s bind groups.
+    solid: Pass,
     crop: Pass,
     copy: Pass,
 }
@@ -361,14 +427,33 @@ struct Passes {
 impl Passes {
     fn new(gpu: &Gpu) -> Self {
         let d = &gpu.device;
+        let depth = |write| wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(write),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        };
         Self {
-            window: Pass::new(
+            window: Pass::with(
                 d,
                 WINDOW_WGSL,
                 true,
                 2,
                 CANVAS_FORMAT,
                 Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                Some(depth(false)),
+                ("vs", "fs"),
+            ),
+            solid: Pass::with(
+                d,
+                WINDOW_WGSL,
+                true,
+                2,
+                CANVAS_FORMAT,
+                None,
+                Some(depth(true)),
+                ("vs_solid", "fs_solid"),
             ),
             crop: Pass::new(d, CROP_WGSL, true, 1, PICTURE_FORMAT, None),
             copy: Pass::new(d, COPY_WGSL, false, 1, FRAME_FORMAT, None),
@@ -397,6 +482,7 @@ pub struct Live {
     /// Made on first use.
     passes: Option<Passes>,
     canvas: Option<wgpu::TextureView>,
+    depth: Option<wgpu::TextureView>,
     /// For the canvas height it was made for.
     shadow: Option<(u32, ShadowKernel)>,
     /// A frame has come in since the last reset: until then the source is shown as is.
@@ -426,6 +512,7 @@ impl Live {
             self.reset();
             self.size = (w, h);
             self.canvas = None;
+            self.depth = None;
         }
         self.started = true;
         self.frame += 1;
@@ -557,19 +644,53 @@ impl Live {
         self.windows.len()
     }
 
-    /// Draws the pile, oldest first, over a clear background into `target`.
+    /// Draws the pile over a clear background into `target`, as if oldest first.
     pub fn draw(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &Frame) {
         let passes = self.passes.get_or_insert_with(|| Passes::new(gpu));
+        let size = (target.width, target.height);
         let canvas = self.canvas.get_or_insert_with(|| {
-            texture(gpu, (target.width, target.height), CANVAS_FORMAT)
-                .create_view(&Default::default())
+            texture(gpu, size, CANVAS_FORMAT).create_view(&Default::default())
+        });
+        let depth = self.depth.get_or_insert_with(|| {
+            texture(gpu, size, DEPTH_FORMAT).create_view(&Default::default())
         });
         {
-            let mut pass = pass(encoder, canvas);
-            pass.set_pipeline(&passes.window.pipeline);
-            for window in &self.windows {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("segcam-live pile"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: canvas,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // Solid insides newest first, so each pixel is painted by the window on top.
+            pass.set_pipeline(&passes.solid.pipeline);
+            for (pile, window) in self.windows.iter().enumerate().rev() {
+                let pile = pile as u32;
                 pass.set_bind_group(0, &window.bind, &[]);
-                pass.draw(0..6, 0..1);
+                pass.draw(0..12, pile..pile + 1);
+            }
+            // Soft parts oldest first, blended, wherever no newer window's inside is.
+            pass.set_pipeline(&passes.window.pipeline);
+            for (pile, window) in self.windows.iter().enumerate() {
+                let pile = pile as u32;
+                pass.set_bind_group(0, &window.bind, &[]);
+                pass.draw(0..6, pile..pile + 1);
             }
         }
         let bind = passes
@@ -838,6 +959,19 @@ mod tests {
             live.len(),
             pushing / 60,
             drawing / 60
+        );
+        // The same with nothing in the pile: what drawing costs whatever the windows.
+        live.reset();
+        let t = Instant::now();
+        for _ in 0..30 {
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            live.draw(&gpu, &mut encoder, &target);
+            gpu.queue.submit(Some(encoder.finish()));
+            wait();
+        }
+        eprintln!(
+            "segcam-live on the GPU, empty pile: drawing {:?}",
+            t.elapsed() / 30
         );
     }
 }
