@@ -1,0 +1,21 @@
+[package]
+name = "vfx-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "One export! for a vfx-core effect crate: the host targets its features switch on."
+
+[features]
+ae = ["dep:vfx-ae"]
+ofx = ["dep:vfx-ofx"]
+ffgl = ["dep:vfx-ffgl"]
+
+[dependencies]
+vfx-core = { path = "../.." }
+vfx-host = { path = "../common" }
+vfx-ofx = { path = "../ofx", optional = true }
+vfx-ffgl = { path = "../ffgl", optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+vfx-ae = { path = "../adobe", optional = true }

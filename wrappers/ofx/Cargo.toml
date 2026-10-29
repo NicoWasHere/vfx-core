@@ -4,15 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+description = "The OpenFX host target: any vfx-core effect as an OpenFX plugin."
 
 [dependencies]
 vfx-core = { path = "../.." }
-vfx-wrapper-common = { path = "../common" }
-pollster = "1.0.1"
-
-[features]
-default = ["plugin"]
-plugin = []
+vfx-host = { path = "../common" }

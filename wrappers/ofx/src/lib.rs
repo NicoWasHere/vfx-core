@@ -1,70 +1,75 @@
-//! OpenFX wrapper for vfx-core: the same effect as the After Effects
-//! plugin, for OpenFX hosts such as DaVinci Resolve, Nuke and Natron.
+//! The OpenFX host target: any vfx-core effect as an OpenFX plugin, for DaVinci Resolve,
+//! Nuke, Natron and other OpenFX hosts. An effect crate exports one with
+//! `vfx_ofx::export!(PLUGIN)` (or `vfx_plugin::export!`, which does every host).
 //!
-//! Frames go through RAM: the source image is read into a straight-alpha f32 canvas,
-//! rendered by the shared pipeline on the plugin's own GPU device, and written back.
-//! The filter context has one input; the general context adds an optional "Layer"
-//! clip for the Blend stage.
+//! GPU effects: the source image is read into a straight-alpha f32 canvas, rendered on the
+//! plugin's own GPU device, and written back; the general context adds the effect's layer
+//! as an optional "Layer" clip. CPU effects get the host's frames at its depth, with the
+//! earlier frames they ask for fetched through temporal clip access.
 
 pub mod ffi;
 pub mod host;
 pub mod image;
+
+mod cpu;
 mod params;
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_void};
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::OnceLock;
 
-use vfx_core::Gpu;
-use vfx_wrapper_common::{Blur, Settings, Vignette, diag, pipeline};
+use vfx_core::cpu::{Argb, Depth as CpuDepth, FrameSource, View, ViewMut};
+use vfx_core::{Context, ParamSpec, ParamValues, Processor, Region};
+use vfx_host::{Kind, diag, pipeline};
 
 use ffi::*;
 use host::{Props, check, suites};
 use image::{Depth, Image, Rect};
 
-static LOG: diag::Log = diag::Log::new(concat!(env!("VFX_PLUGIN_FILE"), "-OpenFX.log"));
+/// For the export macro.
+pub use vfx_host;
 
-/// One device for the whole plugin, created on first render. `None` without a GPU;
-/// renders then pass the image through.
-static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+static LOG: diag::Log = diag::Log::new("-OpenFX.log");
 
-fn gpu() -> Option<&'static Gpu> {
-    GPU.get_or_init(|| match pollster::block_on(Gpu::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            LOG.note(&format!(
-                "warning: no GPU available, passing frames through: {e}"
-            ));
-            None
+/// Exports the plugin a `vfx_host::Plugin` static describes as this binary's OpenFX plugin:
+/// `OfxGetNumberOfPlugins` and `OfxGetPlugin`.
+#[macro_export]
+macro_rules! export {
+    ($plugin:path) => {
+        static __VFX_OFX_PLUGIN: $crate::ffi::OfxPlugin = $crate::ffi::OfxPlugin {
+            pluginApi: $crate::ffi::IMAGE_EFFECT_PLUGIN_API.as_ptr(),
+            apiVersion: 1,
+            pluginIdentifier: $crate::vfx_host::cstr!(env!("VFX_ID")).as_ptr(),
+            pluginVersionMajor: $crate::vfx_host::parse_u32(env!("CARGO_PKG_VERSION_MAJOR")),
+            pluginVersionMinor: $crate::vfx_host::parse_u32(env!("CARGO_PKG_VERSION_MINOR")),
+            setHost: $crate::host::set_host,
+            mainEntry: $crate::main_entry,
+        };
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn OfxGetNumberOfPlugins() -> ::std::ffi::c_int {
+            $crate::vfx_host::register(&$plugin);
+            1
         }
-    })
-    .as_ref()
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn OfxGetPlugin(nth: ::std::ffi::c_int) -> *const $crate::ffi::OfxPlugin {
+            $crate::vfx_host::register(&$plugin);
+            if nth == 0 {
+                &__VFX_OFX_PLUGIN
+            } else {
+                ::std::ptr::null()
+            }
+        }
+    };
 }
 
-static PLUGIN: OfxPlugin = OfxPlugin {
-    pluginApi: IMAGE_EFFECT_PLUGIN_API.as_ptr(),
-    apiVersion: 1,
-    pluginIdentifier: vfx_wrapper_common::plugin_cstr!("VFX_PLUGIN_ID").as_ptr(),
-    pluginVersionMajor: 1,
-    pluginVersionMinor: 0,
-    setHost: host::set_host,
-    mainEntry: main_entry,
-};
-
-#[allow(non_snake_case)]
-#[cfg_attr(feature = "plugin", unsafe(no_mangle))]
-pub extern "C" fn OfxGetNumberOfPlugins() -> c_int {
-    1
-}
-
-#[allow(non_snake_case)]
-#[cfg_attr(feature = "plugin", unsafe(no_mangle))]
-pub extern "C" fn OfxGetPlugin(nth: c_int) -> *const OfxPlugin {
-    if nth == 0 { &PLUGIN } else { ptr::null() }
-}
-
-unsafe extern "C" fn main_entry(
+/// The plugin's one entry point, which the host calls for every action.
+///
+/// # Safety
+/// Called by the host with the OpenFX ABI.
+pub unsafe extern "C" fn main_entry(
     action: *const c_char,
     handle: *const c_void,
     in_args: PropSet,
@@ -96,6 +101,7 @@ fn dispatch(
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
+    let cpu = vfx_host::plugin().kind == Kind::Cpu;
     Ok(if action == ACTION_LOAD {
         if host::load() {
             STAT_OK
@@ -113,13 +119,20 @@ fn dispatch(
     } else if action == ACTION_DESCRIBE_IN_CONTEXT {
         describe_in_context(effect, in_args)?;
         STAT_OK
+    } else if action == ACTION_GET_FRAMES_NEEDED && cpu {
+        frames_needed(effect, in_args, out_args)?;
+        STAT_OK
     } else if action == ACTION_GET_ROD {
         region_of_definition(effect, in_args, out_args)?
     } else if action == ACTION_GET_ROIS {
         regions_of_interest(effect, in_args, out_args)?;
         STAT_OK
     } else if action == ACTION_RENDER {
-        render(effect, in_args)?;
+        if cpu {
+            render_cpu(effect, in_args)?;
+        } else {
+            render_gpu(effect, in_args)?;
+        }
         STAT_OK
     } else {
         STAT_REPLY_DEFAULT
@@ -145,8 +158,10 @@ pub(crate) fn optional(name: &CStr, result: Result<(), OfxStatus>) {
 }
 
 fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
+    let plugin = vfx_host::plugin();
+    let cpu = plugin.kind == Kind::Cpu;
     let p = effect_props(effect)?;
-    p.set_string(PROP_LABEL, env!("VFX_PLUGIN_NAME"))?;
+    p.set_string(PROP_LABEL, plugin.info.name)?;
     p.set_strs(PROP_SUPPORTED_CONTEXTS, &[CONTEXT_FILTER, CONTEXT_GENERAL])?;
     p.set_strs(
         PROP_SUPPORTED_PIXEL_DEPTHS,
@@ -154,30 +169,28 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
     )?;
     optional(
         PROP_GROUPING,
-        p.set_string(PROP_GROUPING, env!("VFX_PLUGIN_CATEGORY")),
+        p.set_string(PROP_GROUPING, plugin.info.category),
     );
     // DaVinci Resolve 21 rejects this one with kOfxStatErrUnknown.
     optional(
         PROP_PLUGIN_DESCRIPTION,
-        p.set_string(
-            PROP_PLUGIN_DESCRIPTION,
-            "vfx-core effect chain: colour adjust, vignette, blend and Gaussian blur on the GPU.",
-        ),
+        p.set_string(PROP_PLUGIN_DESCRIPTION, plugin.info.description),
     );
+    // GPU effects scale pixel distances themselves; CPU effects see whole frames.
     optional(
         PROP_SUPPORTS_MULTI_RESOLUTION,
-        p.set_int(PROP_SUPPORTS_MULTI_RESOLUTION, 0, 1),
+        p.set_int(PROP_SUPPORTS_MULTI_RESOLUTION, 0, i32::from(!cpu)),
     );
     optional(PROP_SUPPORTS_TILES, p.set_int(PROP_SUPPORTS_TILES, 0, 0));
     optional(
         PROP_TEMPORAL_CLIP_ACCESS,
-        p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, 0),
+        p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, i32::from(cpu)),
     );
     optional(
         PROP_MULTIPLE_CLIP_DEPTHS,
         p.set_int(PROP_MULTIPLE_CLIP_DEPTHS, 0, 0),
     );
-    // Each render leases its own chain from the pool, so concurrent renders are safe.
+    // Each render makes or leases its own instance, so concurrent renders are safe.
     optional(
         PROP_RENDER_THREAD_SAFETY,
         p.set_str(PROP_RENDER_THREAD_SAFETY, 0, RENDER_FULLY_SAFE),
@@ -189,7 +202,12 @@ fn describe(effect: ImageEffect) -> Result<(), OfxStatus> {
     Ok(())
 }
 
-fn define_clip(effect: ImageEffect, name: &CStr, optional: bool) -> Result<(), OfxStatus> {
+fn define_clip(
+    effect: ImageEffect,
+    name: &CStr,
+    optional: bool,
+    temporal: bool,
+) -> Result<(), OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a descriptor handle in the describe-in-context action.
     check(unsafe { (suites().effect.clipDefine)(effect, name.as_ptr(), &mut props) })?;
@@ -199,20 +217,34 @@ fn define_clip(effect: ImageEffect, name: &CStr, optional: bool) -> Result<(), O
     if optional {
         p.set_int(CLIP_PROP_OPTIONAL, 0, 1)?;
     }
+    if temporal {
+        self::optional(
+            PROP_TEMPORAL_CLIP_ACCESS,
+            p.set_int(PROP_TEMPORAL_CLIP_ACCESS, 0, 1),
+        );
+    }
     Ok(())
 }
 
+/// Whether this context has the effect's layer: the general context does, for effects
+/// with one.
+fn has_layer_clip(general: bool) -> bool {
+    general && vfx_host::plugin().outline().layers > 0
+}
+
 fn describe_in_context(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+    let plugin = vfx_host::plugin();
     let general = in_args.str_is(PROP_CONTEXT, CONTEXT_GENERAL)?;
-    define_clip(effect, CLIP_SOURCE, false)?;
-    if general {
-        define_clip(effect, CLIP_LAYER, true)?;
+    let layer = has_layer_clip(general);
+    define_clip(effect, CLIP_SOURCE, false, plugin.kind == Kind::Cpu)?;
+    if layer {
+        define_clip(effect, CLIP_LAYER, true, false)?;
     }
-    define_clip(effect, CLIP_OUTPUT, false)?;
+    define_clip(effect, CLIP_OUTPUT, false, false)?;
     let mut set = ptr::null_mut();
     // SAFETY: a descriptor handle.
     check(unsafe { (suites().effect.getParamSet)(effect, &mut set) })?;
-    params::define(set, general)
+    params::define(set, plugin.params(), layer)
 }
 
 fn clip(effect: ImageEffect, name: &CStr) -> Option<Clip> {
@@ -224,47 +256,64 @@ fn clip(effect: ImageEffect, name: &CStr) -> Option<Clip> {
     (status == STAT_OK && !clip.is_null()).then_some(clip)
 }
 
-fn clip_connected(clip: Clip) -> bool {
+fn clip_props(clip: Clip) -> Result<Props, OfxStatus> {
     let mut props = ptr::null_mut();
     // SAFETY: a clip handle from clipGetHandle.
-    if unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) } != STAT_OK {
-        return false;
-    }
-    Props(props).get_int(CLIP_PROP_CONNECTED, 0).unwrap_or(0) != 0
+    check(unsafe { (suites().effect.clipGetPropertySet)(clip, &mut props) })?;
+    Ok(Props(props))
 }
 
-/// Blur growth in full-resolution pixels, and whether it grows past the source.
-fn blur_reach(values: &params::Values) -> (f64, f64, bool) {
-    match values.blur {
-        Some(b) => {
-            let r = f64::from(b.radius).ceil();
-            let (x, y) = match b.direction {
-                1 => (r, 0.0),
-                2 => (0.0, r),
-                _ => (r, r),
-            };
-            (x, y, b.grow)
-        }
-        None => (0.0, 0.0, false),
+fn clip_connected(clip: Clip) -> bool {
+    clip_props(clip)
+        .and_then(|p| p.get_int(CLIP_PROP_CONNECTED, 0))
+        .unwrap_or(0)
+        != 0
+}
+
+fn values(effect: ImageEffect, time: OfxTime) -> Result<ParamValues, OfxStatus> {
+    params::Reader::new(effect, time)?.values(vfx_host::plugin().params())
+}
+
+/// The GPU effect's region at `scale` (1 in canonical coordinates). CPU effects use the
+/// whole frame.
+fn region(values: &ParamValues, scale: [f64; 2]) -> Region {
+    match (vfx_host::plugin().make)() {
+        Processor::Gpu(e) => e.region(values, [scale[0] as f32, scale[1] as f32]),
+        Processor::Cpu(_) => Region::default(),
     }
 }
 
-/// With Blur Edges on, the output reaches past the source by the blur radius.
+fn source_rod(effect: ImageEffect, time: OfxTime) -> Result<[f64; 4], OfxStatus> {
+    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let mut rod = [0.0f64; 4];
+    // SAFETY: a clip handle and a four-double rectangle.
+    check(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
+    Ok(rod)
+}
+
+/// The earlier frames a CPU effect reads.
+fn frames_needed(effect: ImageEffect, in_args: Props, out_args: Props) -> Result<(), OfxStatus> {
+    let time = in_args.get_double(PROP_TIME, 0)?;
+    let before = match (vfx_host::plugin().make)() {
+        Processor::Cpu(e) => e.frames_before(&values(effect, time)?),
+        Processor::Gpu(_) => 0,
+    };
+    out_args.set_doubles(CLIP_FRAME_RANGE_SOURCE, &[time - before as f64, time])
+}
+
+/// Where the output reaches past the source, it grows by the effect's reach.
 fn region_of_definition(
     effect: ImageEffect,
     in_args: Props,
     out_args: Props,
 ) -> Result<OfxStatus, OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
-    let values = params::Reader::new(effect, time)?.values()?;
-    let (rx, ry, grow) = blur_reach(&values);
-    if !grow {
+    let r = region(&values(effect, time)?, [1.0, 1.0]);
+    if !r.grows {
         return Ok(STAT_REPLY_DEFAULT);
     }
-    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
-    let mut rod = [0.0f64; 4];
-    // SAFETY: a clip handle and a four-double rectangle.
-    check(unsafe { (suites().effect.clipGetRegionOfDefinition)(source, time, &mut rod) })?;
+    let rod = source_rod(effect, time)?;
+    let [rx, ry] = r.reach.map(f64::from);
     out_args.set_doubles(
         PROP_ROD,
         &[rod[0] - rx, rod[1] - ry, rod[2] + rx, rod[3] + ry],
@@ -272,15 +321,19 @@ fn region_of_definition(
     Ok(STAT_OK)
 }
 
-/// The blur reads pixels beyond the area it renders, so ask for that much more input.
+/// GPU effects read their reach past the area they render; CPU effects read whole frames.
 fn regions_of_interest(
     effect: ImageEffect,
     in_args: Props,
     out_args: Props,
 ) -> Result<(), OfxStatus> {
     let time = in_args.get_double(PROP_TIME, 0)?;
-    let values = params::Reader::new(effect, time)?.values()?;
-    let (rx, ry, _) = blur_reach(&values);
+    if vfx_host::plugin().kind == Kind::Cpu {
+        return out_args.set_doubles(CLIP_ROI_SOURCE, &source_rod(effect, time)?);
+    }
+    let [rx, ry] = region(&values(effect, time)?, [1.0, 1.0])
+        .reach
+        .map(f64::from);
     let r = in_args.get_rect_d(PROP_ROI)?;
     let roi = [r[0] - rx, r[1] - ry, r[2] + rx, r[3] + ry];
     out_args.set_doubles(CLIP_ROI_SOURCE, &roi)?;
@@ -352,35 +405,27 @@ fn fetch(clip: Clip, time: OfxTime) -> Result<Option<Fetched>, OfxStatus> {
     Ok(Some(fetched))
 }
 
-/// Converts control values into the pipeline's units for a canvas at `scale`.
-fn settings(values: &params::Values, scale: [f64; 2], canvas: Rect) -> Settings {
-    let (sx, sy) = (scale[0] as f32, scale[1] as f32);
-    Settings {
-        linear: values.linear,
-        color: values.color,
-        vignette: values.vignette.map(|v| Vignette {
-            // Canonical (bottom-left, full resolution) to top-down canvas pixels.
-            center_px: [
-                (v.center[0] * scale[0]) as f32 - canvas.x1 as f32,
-                canvas.y2 as f32 - (v.center[1] * scale[1]) as f32,
-            ],
-            radius: v.radius,
-            softness: v.softness,
-            color: v.color,
-            amount: v.amount,
-        }),
-        blend_mode: values.blend_mode,
-        blend_amount: values.blend_amount,
-        blur: values.blur.map(|b| Blur {
-            radius: b.radius * sx,
-            vertical_scale: if sx > 0.0 { sy / sx } else { 1.0 },
-            direction: b.direction,
-            grow: b.grow,
-        }),
-    }
+/// The host's time (frames) in seconds.
+fn seconds(effect: ImageEffect, time: OfxTime) -> Result<f64, OfxStatus> {
+    let rate = effect_props(effect)?
+        .get_double(PROP_FRAME_RATE, 0)
+        .unwrap_or(24.0);
+    Ok(if rate > 0.0 { time / rate } else { time })
 }
 
-fn render(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+/// Canonical point values (full-resolution pixels, y up) to normalised canvas coordinates.
+fn map_points(values: &mut ParamValues, specs: &[ParamSpec], scale: [f64; 2], canvas: Rect) {
+    let (w, h) = (canvas.width() as f64, canvas.height() as f64);
+    vfx_host::map_points(values, specs, |[x, y]| {
+        [
+            ((f64::from(x) * scale[0] - f64::from(canvas.x1)) / w) as f32,
+            ((f64::from(canvas.y2) - f64::from(y) * scale[1]) / h) as f32,
+        ]
+    });
+}
+
+fn render_gpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+    let plugin = vfx_host::plugin();
     let time = in_args.get_double(PROP_TIME, 0)?;
     let window = in_args.get_rect_i(PROP_RENDER_WINDOW)?;
     let scale = [
@@ -393,20 +438,20 @@ fn render(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         Some(c) if clip_connected(c) => fetch(c, time)?,
         _ => None,
     };
-    let values = params::Reader::new(effect, time)?.values()?;
+    let mut values = values(effect, time)?;
 
     let window = window.intersect(&output.image.bounds);
     if window.is_empty() {
         return Ok(());
     }
-    // Render a canvas that also covers the pixels the blur reads around the window.
-    let (rx, ry, grow) = blur_reach(&values);
-    let reach = window.grow((rx * scale[0]).ceil() as i32, (ry * scale[1]).ceil() as i32);
+    // Render a canvas that also covers the pixels the effect reads around the window.
+    let r = region(&values, scale);
+    let reach = window.grow(r.reach[0], r.reach[1]);
     let canvas = match &source {
-        Some(s) if !grow => reach.intersect(&s.image.bounds).union(&window),
+        Some(s) if !r.grows => reach.intersect(&s.image.bounds).union(&window),
         _ => reach,
     };
-    let settings = settings(&values, scale, canvas);
+    map_points(&mut values, plugin.params(), scale, canvas);
     // SAFETY: images come from the host and are described by their own properties.
     let input = match &source {
         Some(s) => unsafe { image::decode(&s.image, canvas) },
@@ -416,25 +461,25 @@ fn render(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
         .as_ref()
         .map(|l| unsafe { image::decode(&l.image, canvas) });
 
-    let frame_rate = effect_props(effect)?
-        .get_double(PROP_FRAME_RATE, 0)
-        .unwrap_or(24.0);
     let job = pipeline::Job {
-        settings: &settings,
-        width: canvas.width() as u32,
-        height: canvas.height() as u32,
+        spec: pipeline::Spec {
+            values: &values,
+            ctx: Context {
+                time: seconds(effect, time)?,
+                frame: time.round() as i64,
+                scale: scale.map(|s| s as f32),
+                premultiplied: false,
+            },
+            width: canvas.width() as u32,
+            height: canvas.height() as u32,
+            has_layer: layer_pixels.is_some(),
+        },
         input: &input,
         layer: layer_pixels.as_deref(),
-        canvas_origin: [0.0, 0.0],
-        time: if frame_rate > 0.0 {
-            time / frame_rate
-        } else {
-            time
-        },
     };
     let depth = output.image.depth;
     LOG.note(&format!("render path: CPU (frames through RAM), {depth:?}"));
-    let result = match gpu() {
+    let result = match vfx_host::gpu(&LOG) {
         Some(gpu) => {
             catch_unwind(AssertUnwindSafe(|| pipeline::run(gpu, &job))).unwrap_or_else(|_| {
                 LOG.note("warning: GPU render failed, passing frames through");
@@ -446,4 +491,131 @@ fn render(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
     // SAFETY: the window lies inside the output image's bounds and the canvas.
     unsafe { image::encode(&result, canvas, &output.image, window) };
     Ok(())
+}
+
+/// Hands a CPU effect the source frames it reads, oldest first, each fetched and
+/// converted when asked for and released straight after.
+struct Source<C> {
+    clip: Clip,
+    /// The clip's first frame; earlier ones don't exist.
+    start: f64,
+    /// The time of frame 0.
+    first: f64,
+    canvas: Rect,
+    error: Option<OfxStatus>,
+    _depth: PhantomData<C>,
+}
+
+impl<C: CpuDepth> FrameSource for Source<C> {
+    fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<vfx_core::cpu::Image<'_>>)) {
+        let time = self.first + index as f64;
+        if time < self.start {
+            f(None);
+            return;
+        }
+        match fetch(self.clip, time) {
+            Ok(Some(frame)) => {
+                // SAFETY: the fetched image stays alive through the closure.
+                let pixels = unsafe { cpu::decode::<C>(&frame.image, self.canvas) };
+                let (w, h) = (self.canvas.width() as i32, self.canvas.height() as i32);
+                f(Some(C::image(View::from_pixels(&pixels, w, h))));
+            }
+            Ok(None) => {
+                self.error.get_or_insert(STAT_FAILED);
+                f(None);
+            }
+            Err(e) => {
+                self.error.get_or_insert(e);
+                f(None);
+            }
+        }
+    }
+}
+
+fn render_cpu(effect: ImageEffect, in_args: Props) -> Result<(), OfxStatus> {
+    let plugin = vfx_host::plugin();
+    let Processor::Cpu(mut cpu_effect) = (plugin.make)() else {
+        return Err(STAT_FAILED);
+    };
+    let time = in_args.get_double(PROP_TIME, 0)?;
+    let output = fetch(clip(effect, CLIP_OUTPUT).ok_or(STAT_FAILED)?, time)?.ok_or(STAT_FAILED)?;
+    let source = clip(effect, CLIP_SOURCE).ok_or(STAT_FAILED)?;
+    let source_props = clip_props(source)?;
+    let start = source_props.get_double(PROP_FRAME_RANGE, 0)?;
+    let values = values(effect, time)?;
+    let count = cpu_effect.frames_before(&values) + 1;
+    let ctx = Context {
+        time: seconds(effect, time)?,
+        frame: time.round() as i64,
+        // CPU effects see whole frames; a host may leave the scale out.
+        scale: [0, 1].map(|i| in_args.get_double(PROP_RENDER_SCALE, i).unwrap_or(1.0) as f32),
+        premultiplied: source_props.str_is(PROP_PREMULTIPLICATION, PREMULTIPLIED)?,
+    };
+    let window = in_args
+        .get_rect_i(PROP_RENDER_WINDOW)?
+        .intersect(&output.image.bounds);
+    let canvas = output.image.bounds;
+    let first = time - (count - 1) as f64;
+    LOG.note(&format!(
+        "render path: CPU effect, {:?} frames, {count} read",
+        output.image.depth
+    ));
+    let error = if output.image.depth == Depth::Byte {
+        draw::<u8>(
+            &mut *cpu_effect,
+            source,
+            start,
+            first,
+            count,
+            canvas,
+            &values,
+            &ctx,
+            &output.image,
+            window,
+        )
+    } else {
+        draw::<f32>(
+            &mut *cpu_effect,
+            source,
+            start,
+            first,
+            count,
+            canvas,
+            &values,
+            &ctx,
+            &output.image,
+            window,
+        )
+    };
+    error.map_or(Ok(()), Err)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw<C: CpuDepth>(
+    effect: &mut dyn vfx_core::CpuEffect,
+    clip: Clip,
+    start: f64,
+    first: f64,
+    count: usize,
+    canvas: Rect,
+    values: &ParamValues,
+    ctx: &Context,
+    output: &Image,
+    window: Rect,
+) -> Option<OfxStatus> {
+    let mut frames = Source::<C> {
+        clip,
+        start,
+        first,
+        canvas,
+        error: None,
+        _depth: PhantomData,
+    };
+    let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+    let mut pixels = vec![Argb::<C>::default(); canvas.width() * canvas.height()];
+    let view = C::image_mut(ViewMut::from_pixels(&mut pixels, w, h));
+    effect.render(&mut frames, count, view, values, ctx);
+    // SAFETY: the render window is clipped to the output and canvas bounds.
+    unsafe { cpu::encode(&pixels, canvas, output, window) };
+    frames.error
 }

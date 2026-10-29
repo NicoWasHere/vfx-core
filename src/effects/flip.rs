@@ -1,24 +1,10 @@
 use crate::shader::{self, Uniform};
-use crate::{Effect, Frame, Gpu, ParamKind, ParamSpec, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
 // Numbers rather than switches, so hosts can animate or drive them: above 0.5 flips.
 const PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "flip_x",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 1.0,
-            default: 0.0,
-        },
-    },
-    ParamSpec {
-        name: "flip_y",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 1.0,
-            default: 0.0,
-        },
-    },
+    ParamSpec::float("flip_x", 0.0, 1.0, 0.0),
+    ParamSpec::float("flip_y", 0.0, 1.0, 0.0),
 ];
 
 // Each output pixel reads the input pixel mirrored across the frame on the flipped axes.
@@ -72,7 +58,7 @@ impl Effect for Flip {
         input: &Frame,
         output: &Frame,
         params: &ParamValues,
-        _time: f64,
+        _ctx: &Context,
     ) {
         let built = self.built.as_ref().expect("prepare before render");
         // The uniform is always 4 (or 8) floats; the last two are unused here.

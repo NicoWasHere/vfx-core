@@ -1,0 +1,11 @@
+[package]
+name = "cargo-vfx"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Builds vfx-core effect crates into plugins for After Effects, OpenFX and FFGL hosts."
+
+[dependencies]
+vfx-build = { path = "../../wrappers/build" }
+serde_json = "1"

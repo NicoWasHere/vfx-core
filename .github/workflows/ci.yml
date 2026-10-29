@@ -11,6 +11,8 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      WGPU_BACKEND: ${{ runner.os == 'Linux' && 'vulkan' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,23 +29,18 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # The core, the host-neutral crates and the effect crates (as libraries): plain Rust
+      # and wgpu, so they build and test on every OS.
       - name: Clippy
-        run: cargo clippy -p vfx-core --all-targets -- -D warnings
+        run: cargo clippy -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p cargo-vfx --all-targets -- -D warnings
 
-      - name: Tests (headless render, reference checks)
-        env:
-          WGPU_BACKEND: ${{ runner.os == 'Linux' && 'vulkan' || '' }}
-        run: cargo test -p vfx-core
+      - name: Tests (headless render, effects, reference checks)
+        run: cargo test -p vfx-core -p vfx-host -p vfx-build -p vfx-chain -p segcam-motion -p cargo-vfx
 
-      # The segcam Motion example: its core is plain Rust, so it tests on every OS.
-      - name: segcam Motion example (clippy, core checks)
-        run: |
-          cargo clippy -p segcam-motion --no-default-features --all-targets -- -D warnings
-          cargo test -p segcam-motion --no-default-features
-
-  # The After Effects / Premiere plugin: a universal .plugin bundle on macOS and an
-  # .aex on Windows. Unsigned; signing needs the publisher's certificates.
-  adobe-plugin:
+  # Every effect as a plugin for every host: After Effects (.plugin / .aex), OpenFX and
+  # FFGL, each built by `cargo vfx` from one binary per effect. Unsigned; signing needs
+  # the publisher's certificates.
+  plugins:
     strategy:
       fail-fast: false
       matrix:
@@ -57,87 +54,40 @@ jobs:
           targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
           components: clippy
 
-      - name: Wrapper tests (pixel conversion, pipeline, Metal interop on macOS)
-        run: cargo test -p vfx-adobe --lib
-
-      - name: segcam FFGL tests and clippy
+      - name: Host target tests and clippy (every host feature on)
         run: |
-          cargo test -p segcam-motion-ffgl -p vfx-ffgl-common
-          cargo clippy -p segcam-motion-ffgl -p vfx-ffgl-common -p vfx-ffgl --all-targets -- -D warnings
+          cargo test -p vfx-ae -p vfx-ofx -p vfx-ffgl -p vfx-ffgl-common
+          cargo clippy -p vfx-ae -p vfx-ofx -p vfx-ffgl -p vfx-ffgl-common -p vfx-plugin -p vfx-chain -p segcam-motion --features vfx-chain/ae,vfx-chain/ofx,vfx-chain/ffgl,segcam-motion/ae,segcam-motion/ofx,segcam-motion/ffgl --all-targets -- -D warnings
 
-      - name: segcam FFGL mini host and CLI comparison (macOS)
+      # Each effect in the minimal OpenFX host, built on the official OpenFX headers:
+      # VFX Preview's checks, and segcam's frames against its CLI.
+      - name: OpenFX mini hosts
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
+          export OFX_INCLUDE="$RUNNER_TEMP/openfx/include"
+          [ "$RUNNER_OS" = Windows ] && export CC=clang
+          ./wrappers/ofx/minihost/run.sh
+          SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" ./effects/segcam-motion/ofx-tests/run.sh
+
+      # FFGL needs an OpenGL context: macOS runners provide Apple's software renderer.
+      # The Windows FFGL mini host runs locally only; runners have no OpenGL 4.1 GPU.
+      - name: FFGL mini hosts (macOS)
         if: runner.os == 'macOS'
         env:
           FFGL_MINIHOST_SOFTWARE: 1
-        run: ./examples/segcam-motion-ffgl/minihost/run.sh
-
-      # OpenFX and FFGL: unit tests, then each plugin in its minimal host. The OpenFX
-      # host needs the OpenFX headers (from the official repository); the FFGL host
-      # needs an OpenGL context, which macOS runners provide.
-      - name: OpenFX and FFGL wrapper tests
-        if: runner.os == 'macOS'
         run: |
-          cargo test -p vfx-wrapper-common -p vfx-ofx -p vfx-ffgl
-          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
-          OFX_INCLUDE="$RUNNER_TEMP/openfx/include" ./wrappers/ofx/minihost/run.sh
           ./wrappers/ffgl/minihost/run.sh
+          ./effects/segcam-motion/ffgl-tests/run.sh
 
-      - name: Build macOS bundle and installer
-        if: runner.os == 'macOS'
-        run: |
-          ./wrappers/adobe/package-mac.sh
-          ./examples/segcam-motion/package-mac.sh
-          ./wrappers/ffgl/bundle-mac.sh
-          ./examples/segcam-motion-ffgl/bundle-mac.sh
-
-      - name: Build Windows .aex
-        if: runner.os == 'Windows'
+      - name: Build every plugin
         shell: bash
         run: |
-          . ./plugin.env
-          cargo build -p vfx-adobe -p segcam-motion --release
-          mkdir -p target/vfx-plugin
-          cp target/release/vfx_adobe.dll "target/vfx-plugin/$PLUGIN_FILE.aex"
-          cp target/release/segcam_motion.dll target/vfx-plugin/SegcamMotionRust.aex
-
-      # OpenFX on Windows: the same unit tests and mini host as on macOS, the host built
-      # with the runner's clang, then the bundle for Resolve and other OpenFX hosts.
-      - name: OpenFX wrapper tests (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          cargo test -p vfx-wrapper-common -p vfx-ofx
-          git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "$RUNNER_TEMP/openfx"
-          CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" ./wrappers/ofx/minihost/run.sh
-
-      - name: segcam Motion OpenFX tests and bundle
-        shell: bash
-        run: |
-          cargo test -p segcam-motion-ofx --no-default-features
-          cargo clippy -p segcam-motion-ofx -p segcam-motion -p vfx-ofx --no-default-features --all-targets -- -D warnings
-          CC=clang OFX_INCLUDE="$RUNNER_TEMP/openfx/include" SEGCAM_TEST_DIR="$RUNNER_TEMP/segcam-ofx" bash examples/segcam-motion-ofx/tests/run.sh
-          if [ "$RUNNER_OS" = Windows ]; then
-            bash examples/segcam-motion-ofx/bundle-win.sh
+          if [ "$RUNNER_OS" = macOS ]; then
+            cargo vfx package
           else
-            bash examples/segcam-motion-ofx/bundle-mac.sh
+            cargo vfx build
           fi
-
-      - name: Build Windows OpenFX bundle
-        if: runner.os == 'Windows'
-        shell: bash
-        run: ./wrappers/ofx/bundle-win.sh
-
-      - name: FFGL wrapper tests (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test -p vfx-ffgl
-
-      # The Windows FFGL mini host runs locally only; runners have no OpenGL 4.1 GPU.
-      - name: Build Windows FFGL DLL
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          ./wrappers/ffgl/bundle-win.sh
-          ./examples/segcam-motion-ffgl/bundle-win.sh
 
       - uses: actions/upload-artifact@v4
         with:

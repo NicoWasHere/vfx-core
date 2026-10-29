@@ -1,36 +1,13 @@
 use crate::shader::{self, Uniform};
-use crate::{Effect, Frame, Gpu, ParamKind, ParamSpec, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues, Region, Unit};
 
 pub const BLUR_DIRECTIONS: &[&str] = &["Both", "Horizontal", "Vertical"];
 
 const PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "radius",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 256.0,
-            default: 4.0,
-        },
-    },
-    ParamSpec {
-        name: "direction",
-        kind: ParamKind::Int {
-            min: 0,
-            max: 2,
-            default: 0,
-            options: BLUR_DIRECTIONS,
-        },
-    },
-    // Multiplies the vertical radius. Hosts use it when the horizontal and vertical
-    // pixel scales differ, such as a preview downsampled unevenly.
-    ParamSpec {
-        name: "vertical_scale",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 4.0,
-            default: 1.0,
-        },
-    },
+    ParamSpec::float("radius", 0.0, 256.0, 4.0).unit(Unit::Pixels),
+    ParamSpec::choice("direction", BLUR_DIRECTIONS, 0),
+    // Multiplies the vertical radius, for pixels that aren't square.
+    ParamSpec::float("vertical_scale", 0.0, 4.0, 1.0),
 ];
 
 // Gaussian with sigma = radius / 2, normalised per pass. Edge taps clamp to the frame.
@@ -71,6 +48,24 @@ struct Built {
     scratch: Frame,
 }
 
+/// The blur's radius in buffer pixels along each axis, at render `scale`. A zero radius
+/// makes a pass a straight copy, which switches that axis off.
+fn radii(params: &ParamValues, scale: [f32; 2]) -> [f32; 2] {
+    let radius = params.float("radius");
+    let direction = params.int("direction");
+    let horizontal = if direction == 2 {
+        0.0
+    } else {
+        radius * scale[0]
+    };
+    let vertical = if direction == 1 {
+        0.0
+    } else {
+        radius * params.float("vertical_scale") * scale[1]
+    };
+    [horizontal, vertical]
+}
+
 impl Effect for GaussianBlur {
     fn params(&self) -> &[ParamSpec] {
         PARAMS
@@ -93,18 +88,10 @@ impl Effect for GaussianBlur {
         input: &Frame,
         output: &Frame,
         params: &ParamValues,
-        _time: f64,
+        ctx: &Context,
     ) {
         let built = self.built.as_ref().expect("prepare before render");
-        let radius = params.float("radius");
-        let direction = params.int("direction");
-        // A zero radius makes a pass a straight copy, which switches that axis off.
-        let horizontal = if direction == 2 { 0.0 } else { radius };
-        let vertical = if direction == 1 {
-            0.0
-        } else {
-            radius * params.float("vertical_scale")
-        };
+        let [horizontal, vertical] = radii(params, ctx.scale);
         let passes = [
             (input, &built.scratch, [1.0, 0.0], horizontal),
             (&built.scratch, output, [0.0, 1.0], vertical),
@@ -119,5 +106,13 @@ impl Effect for GaussianBlur {
             shader::fullscreen_pass(&mut encoder, &built.pipeline, &bind, &dst.view);
         }
         gpu.queue.submit(Some(encoder.finish()));
+    }
+
+    fn region(&self, params: &ParamValues, scale: [f32; 2]) -> Region {
+        let [x, y] = radii(params, scale);
+        Region {
+            reach: [x.ceil() as i32, y.ceil() as i32],
+            grows: false,
+        }
     }
 }

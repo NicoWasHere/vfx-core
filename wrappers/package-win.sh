@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Builds the Windows plugins and packages them for a release (names from plugin.env):
-#   target/vfx-plugin/<PLUGIN_FILE>-<version>-Windows-Setup.exe   installer (Inno Setup)
-#   target/vfx-plugin/<PLUGIN_FILE>-<version>-Windows.zip         the same files, to copy by hand
+# Builds an effect's Windows plugins and packages them for a release:
+#   target/vfx-plugin/<file>-<version>-Windows-Setup.exe   installer (Inno Setup)
+#   target/vfx-plugin/<file>-<version>-Windows.zip         the same files, to copy by hand
+# The names come from the effect crate's [package.metadata.vfx] (`cargo vfx env`).
 # Usage: ./package-win.sh   (run from Git Bash)
+#   EFFECT    the effect crate, default vfx-chain
 #   VERSION   the release version, default "dev"
-#   PLUGINS   which plugins to build and include, default "ofx ffgl adobe"
+#   PLUGINS   which hosts to build and include, default "ofx ffgl adobe"
 #   ISCC      Inno Setup's compiler, if it isn't on PATH or in its default folders
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 target="$here/../target"
 out="$target/vfx-plugin"
+effect="${EFFECT:-vfx-chain}"
 version="${VERSION:-dev}"
 plugins="${PLUGINS:-ofx ffgl adobe}"
-# The plugin's names and IDs.
-. "$here/../plugin.env"
+# The plugin's names and IDs: PLUGIN_NAME, PLUGIN_FILE and so on.
+eval "$(cargo vfx env -p "$effect")"
 
 iscc="${ISCC:-$(command -v iscc || true)}"
 if [ -z "$iscc" ]; then
@@ -30,18 +33,17 @@ fi
 
 mkdir -p "$out"
 rm -rf "$out/$PLUGIN_FILE.ofx.bundle" "$out/$PLUGIN_FILE.dll" "$out/$PLUGIN_FILE.aex"
+hosts=()
 files=()
 for plugin in $plugins; do
   case "$plugin" in
-    ofx) "$here/ofx/bundle-win.sh" release; files+=("$PLUGIN_FILE.ofx.bundle") ;;
-    ffgl) "$here/ffgl/bundle-win.sh" release; files+=("$PLUGIN_FILE.dll") ;;
-    adobe)
-      cargo build --manifest-path "$here/adobe/Cargo.toml" --release
-      cp "$target/release/vfx_adobe.dll" "$out/$PLUGIN_FILE.aex"
-      files+=("$PLUGIN_FILE.aex") ;;
+    ofx) hosts+=(ofx); files+=("$PLUGIN_FILE.ofx.bundle") ;;
+    ffgl) hosts+=(ffgl); files+=("$PLUGIN_FILE.dll") ;;
+    adobe) hosts+=(ae); files+=("$PLUGIN_FILE.aex") ;;
     *) echo "unknown plugin $plugin" >&2; exit 2 ;;
   esac
 done
+cargo vfx build -p "$effect" --hosts "$(IFS=,; echo "${hosts[*]}")"
 
 cat > "$out/INSTALL.txt" <<TXT
 $PLUGIN_NAME plugins for Windows (64-bit)

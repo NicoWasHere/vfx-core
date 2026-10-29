@@ -28,8 +28,8 @@ use objc2_metal::{
 };
 use vfx_core::Gpu;
 use vfx_core::wgpu::{self, hal};
-use vfx_wrapper_common::Settings;
-use vfx_wrapper_common::pipeline::{FRAME_FORMAT, HEADLESS_DEVICE, Lease, Spec};
+use vfx_core::{Context, ParamValues};
+use vfx_host::pipeline::{FRAME_FORMAT, HEADLESS_DEVICE, Lease, Spec};
 
 use crate::gl;
 
@@ -262,8 +262,8 @@ impl Interop {
     pub unsafe fn render(
         &self,
         gpu: &Gpu,
-        settings: &Settings,
-        time: f64,
+        values: &ParamValues,
+        ctx: Context,
         texture: gl::GLuint,
         hardware: (u32, u32),
         host_fbo: gl::GLuint,
@@ -284,11 +284,11 @@ impl Interop {
 
         // 2. The pipeline, entirely on the GPU.
         let spec = Spec {
-            settings,
+            values,
+            ctx,
             width: w,
             height: h,
             has_layer: false,
-            canvas_origin: [0.0, 0.0],
         };
         let mut lease = Lease::new(gpu, HEADLESS_DEVICE, &spec);
         let extent = wgpu::Extent3d {
@@ -303,7 +303,7 @@ impl Interop {
             extent,
         );
         gpu.queue.submit(Some(encoder.finish()));
-        lease.render(gpu, time);
+        lease.render(gpu);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_texture(
             lease.output().texture.as_image_copy(),

@@ -1,4 +1,4 @@
-use crate::{Effect, Frame, Gpu, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamValues};
 
 struct Stage {
     effect: Box<dyn Effect>,
@@ -49,8 +49,10 @@ impl EffectChain {
         self.prepared = Some((format, size));
     }
 
-    pub fn render(&mut self, gpu: &Gpu, input: &Frame, output: &Frame, time: f64) {
-        self.render_with_layers(gpu, input, &[], output, time);
+    /// Renders `input` through every stage into `output`. `ctx` is a [`Context`], or
+    /// just the time in seconds.
+    pub fn render(&mut self, gpu: &Gpu, input: &Frame, output: &Frame, ctx: impl Into<Context>) {
+        self.render_with_layers(gpu, input, &[], output, ctx);
     }
 
     /// Renders with extra layers (for example a second clip to blend). Every stage that
@@ -61,8 +63,9 @@ impl EffectChain {
         input: &Frame,
         layers: &[&Frame],
         output: &Frame,
-        time: f64,
+        ctx: impl Into<Context>,
     ) {
+        let ctx = ctx.into();
         let (format, size) = self
             .prepared
             .expect("EffectChain::prepare must run before render");
@@ -97,7 +100,7 @@ impl EffectChain {
             };
             stage
                 .effect
-                .render_layers(gpu, current, layers, target, &stage.params, time);
+                .render_layers(gpu, current, layers, target, &stage.params, &ctx);
             current = target;
         }
     }

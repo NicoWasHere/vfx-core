@@ -1,43 +1,12 @@
 use crate::shader::{self, Uniform};
-use crate::{Effect, Frame, Gpu, ParamKind, ParamSpec, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
 const PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "center",
-        kind: ParamKind::Point {
-            default: [0.5, 0.5],
-        },
-    },
-    ParamSpec {
-        name: "radius",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 2.0,
-            default: 0.75,
-        },
-    },
-    ParamSpec {
-        name: "softness",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 2.0,
-            default: 0.5,
-        },
-    },
-    ParamSpec {
-        name: "color",
-        kind: ParamKind::Color {
-            default: [0.0, 0.0, 0.0, 1.0],
-        },
-    },
-    ParamSpec {
-        name: "amount",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-        },
-    },
+    ParamSpec::point("center", [0.5, 0.5]),
+    ParamSpec::float("radius", 0.0, 2.0, 0.75),
+    ParamSpec::float("softness", 0.0, 2.0, 0.5),
+    ParamSpec::color("color", [0.0, 0.0, 0.0, 1.0]),
+    ParamSpec::float("amount", 0.0, 1.0, 1.0),
 ];
 
 // Distance is measured in pixels and divided by half the frame diagonal, so radius 1.0
@@ -95,7 +64,7 @@ impl Effect for Vignette {
         input: &Frame,
         output: &Frame,
         params: &ParamValues,
-        _time: f64,
+        _ctx: &Context,
     ) {
         let built = self.built.as_ref().expect("prepare before render");
         let [cx, cy] = params.point("center");

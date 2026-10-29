@@ -1,31 +1,10 @@
 use crate::shader::{self, Uniform};
-use crate::{Effect, Frame, Gpu, ParamKind, ParamSpec, ParamValues};
+use crate::{Context, Effect, Frame, Gpu, ParamSpec, ParamValues};
 
 const PARAMS: &[ParamSpec] = &[
-    ParamSpec {
-        name: "brightness",
-        kind: ParamKind::Float {
-            min: -1.0,
-            max: 1.0,
-            default: 0.0,
-        },
-    },
-    ParamSpec {
-        name: "contrast",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 4.0,
-            default: 1.0,
-        },
-    },
-    ParamSpec {
-        name: "saturation",
-        kind: ParamKind::Float {
-            min: 0.0,
-            max: 4.0,
-            default: 1.0,
-        },
-    },
+    ParamSpec::float("brightness", -1.0, 1.0, 0.0),
+    ParamSpec::float("contrast", 0.0, 4.0, 1.0),
+    ParamSpec::float("saturation", 0.0, 4.0, 1.0),
 ];
 
 // Values are used as-is. Nothing is clamped here, so float targets keep
@@ -76,7 +55,7 @@ impl Effect for ColorAdjust {
         input: &Frame,
         output: &Frame,
         params: &ParamValues,
-        _time: f64,
+        _ctx: &Context,
     ) {
         let built = self.built.as_ref().expect("prepare before render");
         built.uniform.write(

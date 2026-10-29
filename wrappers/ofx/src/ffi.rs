@@ -139,6 +139,7 @@ pub const ACTION_DESCRIBE_IN_CONTEXT: &CStr = c"OfxImageEffectActionDescribeInCo
 pub const ACTION_GET_ROD: &CStr = c"OfxImageEffectActionGetRegionOfDefinition";
 pub const ACTION_GET_ROIS: &CStr = c"OfxImageEffectActionGetRegionsOfInterest";
 pub const ACTION_RENDER: &CStr = c"OfxImageEffectActionRender";
+pub const ACTION_GET_FRAMES_NEEDED: &CStr = c"OfxImageEffectActionGetFramesNeeded";
 
 // Plugin and contexts.
 pub const IMAGE_EFFECT_PLUGIN_API: &CStr = c"OfxImageEffectPluginAPI";
@@ -166,6 +167,7 @@ pub const PROP_CONTEXT: &CStr = c"OfxImageEffectPropContext";
 pub const PROP_RENDER_WINDOW: &CStr = c"OfxImageEffectPropRenderWindow";
 pub const PROP_RENDER_SCALE: &CStr = c"OfxImageEffectPropRenderScale";
 pub const PROP_FRAME_RATE: &CStr = c"OfxImageEffectPropFrameRate";
+pub const PROP_FRAME_RANGE: &CStr = c"OfxImageEffectPropFrameRange";
 pub const PROP_ROD: &CStr = c"OfxImageEffectPropRegionOfDefinition";
 pub const PROP_ROI: &CStr = c"OfxImageEffectPropRegionOfInterest";
 pub const PROP_PREMULTIPLICATION: &CStr = c"OfxImageEffectPropPreMultiplication";
@@ -179,6 +181,7 @@ pub const CLIP_SOURCE: &CStr = c"Source";
 pub const CLIP_LAYER: &CStr = c"Layer";
 pub const CLIP_ROI_SOURCE: &CStr = c"OfxImageClipPropRoI_Source";
 pub const CLIP_ROI_LAYER: &CStr = c"OfxImageClipPropRoI_Layer";
+pub const CLIP_FRAME_RANGE_SOURCE: &CStr = c"OfxImageClipPropFrameRange_Source";
 pub const CLIP_PROP_OPTIONAL: &CStr = c"OfxImageClipPropOptional";
 pub const CLIP_PROP_CONNECTED: &CStr = c"OfxImageClipPropConnected";
 pub const IMAGE_PROP_DATA: &CStr = c"OfxImagePropData";
@@ -191,6 +194,7 @@ pub const DEPTH_FLOAT: &CStr = c"OfxBitDepthFloat";
 
 // Parameters.
 pub const PARAM_TYPE_DOUBLE: &CStr = c"OfxParamTypeDouble";
+pub const PARAM_TYPE_INTEGER: &CStr = c"OfxParamTypeInteger";
 pub const PARAM_TYPE_BOOLEAN: &CStr = c"OfxParamTypeBoolean";
 pub const PARAM_TYPE_CHOICE: &CStr = c"OfxParamTypeChoice";
 pub const PARAM_TYPE_RGBA: &CStr = c"OfxParamTypeRGBA";

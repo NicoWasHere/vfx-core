@@ -7,7 +7,10 @@ publish = false
 
 [dependencies]
 vfx-core = { path = "../.." }
-vfx-wrapper-common = { path = "../../wrappers/common" }
+vfx-host = { path = "../../wrappers/common" }
+# The repository's effect crates, which the preview offers alongside the core effects.
+vfx-chain = { path = "../../effects/vfx-chain" }
+segcam-motion = { path = "../../effects/segcam-motion" }
 wgpu = "=30.0.1"
 # egui's winit backend targets winit 0.30.
 winit = "0.30.13"
@@ -38,5 +41,5 @@ windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_
 wgpu = { version = "=30.0.1", features = ["fragile-send-sync-non-atomic-wasm"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Document", "Element", "HtmlElement", "Window"] }
+web-sys = { version = "0.3", features = ["Document", "Element", "HtmlElement", "Location", "Window"] }
 console_error_panic_hook = "0.1"

@@ -1,10 +1,52 @@
 use std::fmt;
 
-/// Declares one parameter an effect exposes to its host.
+/// Declares one parameter an effect exposes to its host. Build them with the constructors
+/// ([`ParamSpec::float`] and so on) and the chained setters:
+///
+/// ```
+/// use vfx_core::{ParamSpec, Unit};
+/// const RADIUS: ParamSpec = ParamSpec::float("blur_radius", 0.0, 256.0, 0.0)
+///     .label("Blur Radius")
+///     .group("Blur")
+///     .unit(Unit::Pixels);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ParamSpec {
+    /// The stable identifier: hosts save projects with it, so it never changes once an
+    /// effect ships. Lower case with underscores, by convention.
     pub name: &'static str,
+    /// What hosts show. Empty means a label made from `name` (`flip_x` → "Flip x").
+    /// Keep it under 16 bytes: FFGL hosts cut longer names.
+    pub label: &'static str,
     pub kind: ParamKind,
+    /// Hosts that group controls (OpenFX, FFGL, After Effects) put parameters with the same
+    /// group together, in order. Empty for none.
+    pub group: &'static str,
+    pub unit: Unit,
+    /// A narrower range for the slider, inside the hard range, for floats and ints.
+    pub slider: Option<[f32; 2]>,
+    pub requires: Requires,
+}
+
+/// How a host shows a number. It doesn't change the value an effect receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    Plain,
+    /// The value is a percentage, 0 to 100.
+    Percent,
+    /// Pixels at full resolution. Effects scale these by [`crate::Context::scale`].
+    Pixels,
+}
+
+/// What a parameter needs from its host to mean anything. Hosts leave out parameters
+/// they can't serve, such as blend controls where there is no second input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Requires {
+    Nothing,
+    /// A second input (the effect's layer, see [`crate::Effect::layer_inputs`]).
+    Layer,
+    /// A host that lets the output grow past the input's bounds.
+    Region,
 }
 
 /// The type and range of a parameter. Values outside a float or int range are clamped on set.
@@ -15,7 +57,8 @@ pub enum ParamKind {
         max: f32,
         default: f32,
     },
-    /// A whole number. Hosts may show small ranges as a menu, labelled by `options`.
+    /// A whole number. With `options`, hosts show it as a menu: the value is the option's
+    /// index, from 0.
     Int {
         min: i32,
         max: i32,
@@ -25,14 +68,123 @@ pub enum ParamKind {
     Bool {
         default: bool,
     },
-    /// Linear RGBA. Components are not clamped, so HDR colours are allowed.
+    /// RGBA. Components are not clamped, so HDR colours are allowed.
     Color {
         default: [f32; 4],
     },
     /// A position in normalised frame coordinates: (0, 0) top left, (1, 1) bottom right.
+    /// Hosts convert their own coordinates (layer pixels, canonical, y up) to these.
     Point {
         default: [f32; 2],
     },
+}
+
+impl ParamSpec {
+    const fn new(name: &'static str, kind: ParamKind) -> Self {
+        Self {
+            name,
+            label: "",
+            kind,
+            group: "",
+            unit: Unit::Plain,
+            slider: None,
+            requires: Requires::Nothing,
+        }
+    }
+
+    pub const fn float(name: &'static str, min: f32, max: f32, default: f32) -> Self {
+        Self::new(name, ParamKind::Float { min, max, default })
+    }
+
+    pub const fn int(name: &'static str, min: i32, max: i32, default: i32) -> Self {
+        Self::new(
+            name,
+            ParamKind::Int {
+                min,
+                max,
+                default,
+                options: &[],
+            },
+        )
+    }
+
+    /// A menu of `options`; the value is the chosen option's index.
+    pub const fn choice(
+        name: &'static str,
+        options: &'static [&'static str],
+        default: i32,
+    ) -> Self {
+        Self::new(
+            name,
+            ParamKind::Int {
+                min: 0,
+                max: options.len() as i32 - 1,
+                default,
+                options,
+            },
+        )
+    }
+
+    pub const fn toggle(name: &'static str, default: bool) -> Self {
+        Self::new(name, ParamKind::Bool { default })
+    }
+
+    pub const fn color(name: &'static str, default: [f32; 4]) -> Self {
+        Self::new(name, ParamKind::Color { default })
+    }
+
+    pub const fn point(name: &'static str, default: [f32; 2]) -> Self {
+        Self::new(name, ParamKind::Point { default })
+    }
+
+    pub const fn label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
+    }
+
+    pub const fn group(mut self, group: &'static str) -> Self {
+        self.group = group;
+        self
+    }
+
+    pub const fn unit(mut self, unit: Unit) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    pub const fn slider(mut self, min: f32, max: f32) -> Self {
+        self.slider = Some([min, max]);
+        self
+    }
+
+    pub const fn requires(mut self, requires: Requires) -> Self {
+        self.requires = requires;
+        self
+    }
+
+    /// What a host shows: `label`, or one made from `name`.
+    pub fn display_label(&self) -> String {
+        if !self.label.is_empty() {
+            return self.label.to_owned();
+        }
+        let text = self.name.replace('_', " ");
+        let mut chars = text.chars();
+        chars
+            .next()
+            .map(|c| c.to_uppercase().chain(chars).collect())
+            .unwrap_or_default()
+    }
+
+    /// The slider's range: `slider` if set, else the hard range. `None` for non-numbers.
+    pub fn slider_range(&self) -> Option<[f32; 2]> {
+        match self.kind {
+            ParamKind::Float { min, max, .. } => Some(self.slider.unwrap_or([min, max])),
+            ParamKind::Int { min, max, .. } => {
+                Some(self.slider.unwrap_or([min as f32, max as f32]))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,7 +224,7 @@ impl ParamSpec {
 }
 
 /// The current values for one effect instance, checked against its specs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ParamValues {
     specs: Vec<ParamSpec>,
     values: Vec<ParamValue>,
@@ -164,28 +316,29 @@ mod tests {
     use super::*;
 
     const SPECS: &[ParamSpec] = &[
-        ParamSpec {
-            name: "gain",
-            kind: ParamKind::Float {
-                min: 0.0,
-                max: 2.0,
-                default: 1.0,
-            },
-        },
-        ParamSpec {
-            name: "steps",
-            kind: ParamKind::Int {
-                min: 1,
-                max: 8,
-                default: 2,
-                options: &[],
-            },
-        },
-        ParamSpec {
-            name: "invert",
-            kind: ParamKind::Bool { default: false },
-        },
+        ParamSpec::float("gain", 0.0, 2.0, 1.0),
+        ParamSpec::int("steps", 1, 8, 2),
+        ParamSpec::toggle("invert", false).label("Invert"),
     ];
+
+    #[test]
+    fn labels_come_from_names_unless_set() {
+        assert_eq!(SPECS[0].display_label(), "Gain");
+        assert_eq!(
+            ParamSpec::float("flip_x", 0.0, 1.0, 0.0).display_label(),
+            "Flip x"
+        );
+        assert_eq!(SPECS[2].display_label(), "Invert");
+        assert_eq!(
+            ParamSpec::choice("mode", &["A", "B", "C"], 1).kind,
+            ParamKind::Int {
+                min: 0,
+                max: 2,
+                default: 1,
+                options: &["A", "B", "C"],
+            }
+        );
+    }
 
     #[test]
     fn starts_at_defaults() {

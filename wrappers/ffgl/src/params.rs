@@ -1,120 +1,158 @@
-//! The plugin's FFGL parameters, matching the After Effects and OpenFX controls where
-//! FFGL can express them. Values are stored in their real units: FFGL hosts send and
-//! read values inside a parameter's declared range.
+//! FFGL parameters for any effect, made from its parameter list. FFGL parameters are
+//! single floats in their declared range, so a colour becomes red, green and blue entries
+//! (Resolume shows consecutive ones as one colour picker) and a point X and Y positions
+//! (normalised, y up, as Resolume shows them). Parameters that need a second input or a
+//! growing output are left out: FFGL has neither.
 
-use std::ffi::CStr;
+use std::ffi::CString;
 
-use vfx_wrapper_common::{Blur, Settings, Vignette};
+use vfx_core::{ParamKind, ParamSpec, ParamValue, ParamValues};
+use vfx_ffgl_common::ffi::*;
 
-use crate::ffi::*;
+/// Which part of an effect parameter an FFGL parameter drives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Part {
+    Whole,
+    /// A colour channel, 0 red to 2 blue.
+    Channel(usize),
+    /// A point coordinate, 0 x or 1 y.
+    Axis(usize),
+}
 
 pub struct Param {
-    pub name: &'static CStr,
+    pub name: CString,
     pub kind: u32,
     pub default: f32,
     pub min: f32,
     pub max: f32,
-    pub group: &'static str,
+    pub group: String,
     /// Option labels, for FF_TYPE_OPTION. The value is the option's index.
-    pub options: &'static [&'static CStr],
+    pub options: Vec<CString>,
+    /// The effect parameter (by name) and the part of it this drives.
+    pub spec: &'static str,
+    pub part: Part,
+    /// Rounds to a whole number.
+    pub integer: bool,
 }
 
-const fn toggle(name: &'static CStr, default: bool, group: &'static str) -> Param {
-    Param {
-        name,
-        kind: FF_TYPE_BOOLEAN,
-        default: if default { 1.0 } else { 0.0 },
-        min: 0.0,
-        max: 1.0,
-        group,
-        options: &[],
+fn c_string(text: &str) -> CString {
+    CString::new(text).unwrap_or_default()
+}
+
+/// `label` without a trailing `word` ("Vignette Center" → "Vignette"), or `label`.
+fn base<'a>(label: &'a str, words: &[&str]) -> &'a str {
+    for word in words {
+        if let Some(stripped) = label.strip_suffix(word)
+            && !stripped.is_empty()
+        {
+            return stripped.trim_end();
+        }
     }
+    label
 }
 
-const fn slider(
-    name: &'static CStr,
-    min: f32,
-    max: f32,
-    default: f32,
-    group: &'static str,
-) -> Param {
-    Param {
-        name,
-        kind: FF_TYPE_STANDARD,
-        default,
-        min,
-        max,
-        group,
-        options: &[],
+/// The FFGL parameters for `specs`, in order.
+pub fn table(specs: &[ParamSpec]) -> Vec<Param> {
+    let mut out = Vec::new();
+    for spec in specs.iter().filter(|s| vfx_host::served(s, false, false)) {
+        let label = spec.display_label();
+        let one = |kind, default: f32, min, max, part, name: String| Param {
+            name: c_string(&name),
+            kind,
+            default,
+            min,
+            max,
+            group: spec.group.to_owned(),
+            options: Vec::new(),
+            spec: spec.name,
+            part,
+            integer: false,
+        };
+        match spec.kind {
+            ParamKind::Float { min, max, default } => {
+                out.push(one(FF_TYPE_STANDARD, default, min, max, Part::Whole, label));
+            }
+            ParamKind::Int {
+                min,
+                max,
+                default,
+                options,
+            } => {
+                let menu = !options.is_empty();
+                let kind = if menu {
+                    FF_TYPE_OPTION
+                } else {
+                    FF_TYPE_STANDARD
+                };
+                let mut p = one(
+                    kind,
+                    default as f32,
+                    min as f32,
+                    max as f32,
+                    Part::Whole,
+                    label,
+                );
+                p.options = options.iter().map(|o| c_string(o)).collect();
+                p.integer = true;
+                out.push(p);
+            }
+            ParamKind::Bool { default } => {
+                let value = if default { 1.0 } else { 0.0 };
+                out.push(one(FF_TYPE_BOOLEAN, value, 0.0, 1.0, Part::Whole, label));
+            }
+            ParamKind::Color { default } => {
+                let name = base(&label, &[" Color", " color", " Colour", " colour"]);
+                let lower = label.ends_with("color") || label.ends_with("colour");
+                let channels = if lower {
+                    ["red", "green", "blue"]
+                } else {
+                    ["Red", "Green", "Blue"]
+                };
+                for (i, (kind, channel)) in [FF_TYPE_RED, FF_TYPE_GREEN, FF_TYPE_BLUE]
+                    .into_iter()
+                    .zip(channels)
+                    .enumerate()
+                {
+                    let n = format!("{name} {channel}");
+                    out.push(one(kind, default[i], 0.0, 1.0, Part::Channel(i), n));
+                }
+            }
+            ParamKind::Point { default: [x, y] } => {
+                let name = base(&label, &[" Center", " Centre", " center", " centre"]);
+                out.push(one(
+                    FF_TYPE_XPOS,
+                    x,
+                    0.0,
+                    1.0,
+                    Part::Axis(0),
+                    format!("{name} X"),
+                ));
+                out.push(one(
+                    FF_TYPE_YPOS,
+                    1.0 - y,
+                    0.0,
+                    1.0,
+                    Part::Axis(1),
+                    format!("{name} Y"),
+                ));
+            }
+        }
     }
+    out
 }
 
-const fn typed(name: &'static CStr, kind: u32, default: f32, group: &'static str) -> Param {
-    Param {
-        name,
-        kind,
-        default,
-        min: 0.0,
-        max: 1.0,
-        group,
-        options: &[],
-    }
+/// Clamps a host value into the parameter's range; options and integers snap.
+pub fn clamp(p: &Param, value: f32) -> f32 {
+    let v = if value.is_finite() {
+        value.clamp(p.min, p.max)
+    } else {
+        p.default
+    };
+    if p.integer { v.round() } else { v }
 }
-
-pub const LINEAR: usize = 0;
-pub const COLOR_ENABLE: usize = 1;
-pub const BRIGHTNESS: usize = 2;
-pub const CONTRAST: usize = 3;
-pub const SATURATION: usize = 4;
-pub const VIGNETTE_ENABLE: usize = 5;
-pub const VIGNETTE_X: usize = 6;
-pub const VIGNETTE_Y: usize = 7;
-pub const VIGNETTE_RADIUS: usize = 8;
-pub const VIGNETTE_SOFTNESS: usize = 9;
-pub const VIGNETTE_RED: usize = 10;
-pub const VIGNETTE_GREEN: usize = 11;
-pub const VIGNETTE_BLUE: usize = 12;
-pub const VIGNETTE_AMOUNT: usize = 13;
-pub const BLUR_ENABLE: usize = 14;
-pub const BLUR_RADIUS: usize = 15;
-pub const BLUR_DIRECTION: usize = 16;
-
-/// Option labels match the core's BLUR_DIRECTIONS (checked in a test).
-const DIRECTIONS: &[&CStr] = &[c"Both", c"Horizontal", c"Vertical"];
-
-pub const PARAMS: &[Param] = &[
-    toggle(c"Linear Light", false, ""),
-    toggle(c"Color Adjust", true, "Color"),
-    slider(c"Brightness", -1.0, 1.0, 0.0, "Color"),
-    slider(c"Contrast", 0.0, 4.0, 1.0, "Color"),
-    slider(c"Saturation", 0.0, 4.0, 1.0, "Color"),
-    toggle(c"Vignette", false, "Vignette"),
-    // XPOS / YPOS: normalised, origin at the bottom left, as Resolume shows them.
-    typed(c"Vignette X", FF_TYPE_XPOS, 0.5, "Vignette"),
-    typed(c"Vignette Y", FF_TYPE_YPOS, 0.5, "Vignette"),
-    slider(c"Vignette Radius", 0.0, 2.0, 0.75, "Vignette"),
-    slider(c"Vignette Soft", 0.0, 1.0, 0.5, "Vignette"),
-    // Consecutive RED / GREEN / BLUE params become one colour picker in Resolume.
-    typed(c"Vignette Red", FF_TYPE_RED, 0.0, "Vignette"),
-    typed(c"Vignette Green", FF_TYPE_GREEN, 0.0, "Vignette"),
-    typed(c"Vignette Blue", FF_TYPE_BLUE, 0.0, "Vignette"),
-    slider(c"Vignette Amount", 0.0, 1.0, 1.0, "Vignette"),
-    toggle(c"Blur", true, "Blur"),
-    slider(c"Blur Radius", 0.0, 256.0, 0.0, "Blur"),
-    Param {
-        name: c"Blur Direction",
-        kind: FF_TYPE_OPTION,
-        default: 0.0,
-        min: 0.0,
-        max: 2.0,
-        group: "Blur",
-        options: DIRECTIONS,
-    },
-];
 
 /// Formats a value for the host's 16-character parameter display.
-pub fn display(index: usize, value: f32) -> String {
-    let p = &PARAMS[index];
+pub fn display(p: &Param, value: f32) -> String {
     match p.kind {
         FF_TYPE_BOOLEAN => if value >= 0.5 { "On" } else { "Off" }.to_owned(),
         FF_TYPE_OPTION => p
@@ -122,113 +160,94 @@ pub fn display(index: usize, value: f32) -> String {
             .get(value.round().max(0.0) as usize)
             .map(|o| o.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        _ if p.integer => format!("{value:.0}"),
         _ => format!("{value:.2}"),
     }
 }
 
-/// Clamps a host value into the parameter's range; options snap to an index.
-pub fn clamp(index: usize, value: f32) -> f32 {
-    let p = &PARAMS[index];
-    let v = value.clamp(p.min, p.max);
-    if p.kind == FF_TYPE_OPTION {
-        v.round()
-    } else {
-        v
+/// The effect's values from the FFGL ones. Points come out in normalised, top-down canvas
+/// coordinates; parameters FFGL doesn't show keep their defaults.
+pub fn values(table: &[Param], raw: &[f32], specs: &[ParamSpec]) -> ParamValues {
+    let mut values = ParamValues::new(specs);
+    for (p, &v) in table.iter().zip(raw) {
+        let value = match (values.get(p.spec), p.part) {
+            (Some(ParamValue::Float(_)), Part::Whole) => ParamValue::Float(v),
+            (Some(ParamValue::Int(_)), Part::Whole) => ParamValue::Int(v.round() as i32),
+            (Some(ParamValue::Bool(_)), Part::Whole) => ParamValue::Bool(v >= 0.5),
+            (Some(ParamValue::Color(mut c)), Part::Channel(i)) => {
+                c[i] = v;
+                ParamValue::Color(c)
+            }
+            (Some(ParamValue::Point(mut xy)), Part::Axis(axis)) => {
+                xy[axis] = if axis == 1 { 1.0 - v } else { v };
+                ParamValue::Point(xy)
+            }
+            _ => continue,
+        };
+        let _ = values.set(p.spec, value);
     }
-}
-
-/// One frame's settings for a `width` x `height` frame.
-pub fn settings(values: &[f32], width: u32, height: u32) -> Settings {
-    let on = |i: usize| values[i] >= 0.5;
-    Settings {
-        linear: on(LINEAR),
-        color: on(COLOR_ENABLE).then(|| [values[BRIGHTNESS], values[CONTRAST], values[SATURATION]]),
-        vignette: on(VIGNETTE_ENABLE).then(|| Vignette {
-            // Normalised, y up, to top-down canvas pixels.
-            center_px: [
-                values[VIGNETTE_X] * width as f32,
-                (1.0 - values[VIGNETTE_Y]) * height as f32,
-            ],
-            radius: values[VIGNETTE_RADIUS],
-            softness: values[VIGNETTE_SOFTNESS],
-            color: [
-                values[VIGNETTE_RED],
-                values[VIGNETTE_GREEN],
-                values[VIGNETTE_BLUE],
-                1.0,
-            ],
-            amount: values[VIGNETTE_AMOUNT],
-        }),
-        blend_mode: 0,
-        blend_amount: 0.0,
-        blur: (on(BLUR_ENABLE) && values[BLUR_RADIUS] > 0.0).then(|| Blur {
-            radius: values[BLUR_RADIUS],
-            vertical_scale: 1.0,
-            direction: values[BLUR_DIRECTION].round() as i32,
-            grow: false,
-        }),
-    }
-}
-
-pub fn defaults() -> Vec<f32> {
-    PARAMS.iter().map(|p| p.default).collect()
+    values
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vfx_core::effects::BLUR_DIRECTIONS;
+    use vfx_core::Requires;
 
-    #[test]
-    fn direction_labels_match_the_core() {
-        let labels: Vec<String> = DIRECTIONS
-            .iter()
-            .map(|c| c.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(labels, BLUR_DIRECTIONS);
+    const SPECS: &[ParamSpec] = &[
+        ParamSpec::float("brightness", -1.0, 1.0, 0.0).group("Color"),
+        ParamSpec::point("vignette_center", [0.5, 0.5]).label("Vignette Center"),
+        ParamSpec::color("vignette_color", [0.0, 0.2, 0.0, 1.0]).label("Vignette Color"),
+        ParamSpec::color("box_color", [0.25, 1.0, 0.4, 1.0]).label("Box color"),
+        ParamSpec::choice("mode", &["A", "B", "C"], 1),
+        ParamSpec::int("steps", 1, 120, 16),
+        ParamSpec::float("blend_amount", 0.0, 1.0, 1.0).requires(Requires::Layer),
+        ParamSpec::toggle("blur_grow", false).requires(Requires::Region),
+    ];
+
+    fn names(t: &[Param]) -> Vec<String> {
+        t.iter()
+            .map(|p| p.name.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn indices_name_the_right_params() {
-        assert_eq!(PARAMS[BRIGHTNESS].name, c"Brightness");
-        assert_eq!(PARAMS[VIGNETTE_Y].name, c"Vignette Y");
-        assert_eq!(PARAMS[VIGNETTE_AMOUNT].name, c"Vignette Amount");
-        assert_eq!(PARAMS[BLUR_DIRECTION].name, c"Blur Direction");
-        assert_eq!(PARAMS.len(), BLUR_DIRECTION + 1);
+    fn colours_and_points_split_and_unserved_params_go() {
+        let t = table(SPECS);
+        assert_eq!(
+            names(&t),
+            [
+                "Brightness",
+                "Vignette X",
+                "Vignette Y",
+                "Vignette Red",
+                "Vignette Green",
+                "Vignette Blue",
+                "Box red",
+                "Box green",
+                "Box blue",
+                "Mode",
+                "Steps",
+            ]
+        );
+        assert_eq!(t[0].group, "Color");
+        assert_eq!((t[9].kind, t[9].options.len()), (FF_TYPE_OPTION, 3));
+        assert_eq!(t[4].default, 0.2);
     }
 
     #[test]
-    fn names_stay_under_16_characters() {
-        // FFGL hosts show 16 bytes of a name at most; Resolume cuts the rest. The
-        // other wrappers use the same names, so this keeps them all short.
-        for p in PARAMS {
-            let n = p.name.to_bytes().len();
-            assert!(n < 16, "{:?} is {n} bytes; keep names under 16", p.name);
-        }
-    }
-
-    #[test]
-    fn defaults_change_nothing() {
-        let s = settings(&defaults(), 64, 48);
-        assert!(!s.linear && s.vignette.is_none() && s.blur.is_none());
-        assert_eq!(s.color, Some([0.0, 1.0, 1.0]));
-    }
-
-    #[test]
-    fn vignette_y_is_flipped_to_top_down() {
-        let mut v = defaults();
-        v[VIGNETTE_ENABLE] = 1.0;
-        v[VIGNETTE_X] = 0.25;
-        v[VIGNETTE_Y] = 0.25;
-        let c = settings(&v, 100, 80).vignette.unwrap().center_px;
-        assert_eq!(c, [25.0, 60.0]);
-    }
-
-    #[test]
-    fn values_clamp_and_options_snap() {
-        assert_eq!(clamp(BRIGHTNESS, 3.0), 1.0);
-        assert_eq!(clamp(BLUR_DIRECTION, 1.4), 1.0);
-        assert_eq!(display(BLUR_DIRECTION, 2.0), "Vertical");
-        assert_eq!(display(BLUR_ENABLE, 1.0), "On");
+    fn values_map_back() {
+        let t = table(SPECS);
+        let mut raw: Vec<f32> = t.iter().map(|p| p.default).collect();
+        raw[1] = 0.25; // X
+        raw[2] = 0.25; // Y, up from the bottom
+        raw[10] = clamp(&t[10], 40.6);
+        let v = values(&t, &raw, SPECS);
+        assert_eq!(v.point("vignette_center"), [0.25, 0.75]);
+        assert_eq!(v.int("steps"), 41);
+        assert_eq!(v.int("mode"), 1);
+        assert_eq!(v.color("box_color"), [0.25, 1.0, 0.4, 1.0]);
+        assert_eq!(display(&t[9], 2.0), "C");
+        assert_eq!(display(&t[10], 41.0), "41");
     }
 }

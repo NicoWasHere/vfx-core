@@ -15,10 +15,10 @@
  */
 #define GL_SILENCE_DEPRECATION
 #ifndef PLUGIN_NAME
-#define PLUGIN_NAME "VFX Preview" /* run.sh passes the one in plugin.env */
+#define PLUGIN_NAME "VFX Preview" /* run.sh passes the effect crate's short name */
 #endif
 #ifndef PLUGIN_LOG
-#define PLUGIN_LOG "VfxPreview-FFGL.log" /* run.sh passes <PLUGIN_FILE>-FFGL.log */
+#define PLUGIN_LOG "VfxPreview-FFGL.log" /* run.sh passes <file>-FFGL.log */
 #endif
 
 #include <math.h>

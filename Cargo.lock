@@ -381,6 +381,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo-vfx"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "vfx-build",
+]
+
+[[package]]
 name = "cc"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2690,25 +2698,10 @@ dependencies = [
 name = "segcam-motion"
 version = "1.0.0"
 dependencies = [
- "after-effects",
- "pipl",
-]
-
-[[package]]
-name = "segcam-motion-ffgl"
-version = "0.1.0"
-dependencies = [
- "segcam-motion",
- "vfx-ffgl-common",
- "vfx-wrapper-common",
-]
-
-[[package]]
-name = "segcam-motion-ofx"
-version = "1.0.0"
-dependencies = [
- "segcam-motion",
- "vfx-ofx",
+ "libm",
+ "vfx-build",
+ "vfx-core",
+ "vfx-plugin",
 ]
 
 [[package]]
@@ -3298,17 +3291,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vfx-adobe"
+name = "vfx-ae"
 version = "0.1.0"
 dependencies = [
  "after-effects",
  "bytemuck",
  "objc2 0.6.5",
  "objc2-metal 0.3.2",
- "pipl",
  "pollster 1.0.1",
  "vfx-core",
- "vfx-wrapper-common",
+ "vfx-host",
+]
+
+[[package]]
+name = "vfx-build"
+version = "0.1.0"
+dependencies = [
+ "pipl",
+ "toml",
+]
+
+[[package]]
+name = "vfx-chain"
+version = "1.1.0"
+dependencies = [
+ "pollster 1.0.1",
+ "vfx-build",
+ "vfx-core",
+ "vfx-host",
+ "vfx-plugin",
 ]
 
 [[package]]
@@ -3332,7 +3343,7 @@ dependencies = [
  "pollster 1.0.1",
  "vfx-core",
  "vfx-ffgl-common",
- "vfx-wrapper-common",
+ "vfx-host",
 ]
 
 [[package]]
@@ -3340,12 +3351,31 @@ name = "vfx-ffgl-common"
 version = "0.1.0"
 
 [[package]]
+name = "vfx-host"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster 1.0.1",
+ "vfx-core",
+]
+
+[[package]]
 name = "vfx-ofx"
 version = "0.1.0"
 dependencies = [
- "pollster 1.0.1",
  "vfx-core",
- "vfx-wrapper-common",
+ "vfx-host",
+]
+
+[[package]]
+name = "vfx-plugin"
+version = "0.1.0"
+dependencies = [
+ "vfx-ae",
+ "vfx-core",
+ "vfx-ffgl",
+ "vfx-host",
+ "vfx-ofx",
 ]
 
 [[package]]
@@ -3361,8 +3391,10 @@ dependencies = [
  "ort",
  "pollster 1.0.1",
  "rfd",
+ "segcam-motion",
+ "vfx-chain",
  "vfx-core",
- "vfx-wrapper-common",
+ "vfx-host",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3370,15 +3402,6 @@ dependencies = [
  "wgpu",
  "windows-sys 0.61.2",
  "winit",
-]
-
-[[package]]
-name = "vfx-wrapper-common"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "pollster 1.0.1",
- "vfx-core",
 ]
 
 [[package]]
