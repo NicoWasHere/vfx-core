@@ -21,10 +21,12 @@ for premult in (0,1):
         float_ref=subprocess.run([a.cli,"320","180","--mode",mode,"--float"]+(["--straight-alpha"] if not premult else []),input=raw,stdout=subprocess.PIPE,check=True).stdout
         for depth in (8,16,32):
             for top in (0,1):
-                out=scratch/"output.argb"
-                subprocess.run([a.host,a.plugin,str(source),str(out),str(index),str(depth),str(top),str(premult)],check=True)
-                actual=out.read_bytes(); assert len(actual)==len(ref)
-                error=max(abs(x-y) for x,y in zip(actual,ref if depth==8 else float_ref))
-                assert error <= (0 if depth==8 else 1),(mode,depth,top,premult,error)
-                print(f"{mode} {depth} bit top={top} premult={premult}: max error {error}",flush=True)
-print("36 DLL/CLI comparisons passed")
+                # Forwards, backwards, shuffled, and every frame cold on a fresh instance.
+                for order in (0,1,2,3):
+                    out=scratch/"output.argb"
+                    subprocess.run([a.host,a.plugin,str(source),str(out),str(index),str(depth),str(top),str(premult),str(order)],check=True)
+                    actual=out.read_bytes(); assert len(actual)==len(ref)
+                    error=max(abs(x-y) for x,y in zip(actual,ref if depth==8 else float_ref))
+                    assert error <= (0 if depth==8 else 1),(mode,depth,top,premult,order,error)
+                    print(f"{mode} {depth} bit top={top} premult={premult} order={order}: max error {error}",flush=True)
+print("144 DLL/CLI comparisons passed")

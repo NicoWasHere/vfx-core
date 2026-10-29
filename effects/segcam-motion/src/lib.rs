@@ -11,12 +11,14 @@
 mod chrome;
 pub mod effect;
 pub mod font;
+pub mod incremental;
 pub mod motion;
 pub mod pixel;
 pub mod render;
 pub mod swarm;
 
 pub use effect::SegcamMotion;
+pub use incremental::{Advance, Incremental};
 
 vfx_plugin::export!(cpu: SegcamMotion);
 pub use motion::{Blob, LumaGrid, Motion, MotionSettings, NormRect};

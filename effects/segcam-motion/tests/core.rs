@@ -9,8 +9,8 @@ use segcam_motion::pixel::make_pixel;
 use segcam_motion::render::{PixelRect, downsample, fit_text, text_width};
 use segcam_motion::swarm::{ShadowKernel, SwarmMetrics, Tile, TilePixel, draw_window, make_tile};
 use segcam_motion::{
-    Argb, Blob, Channel, Color, MotionSettings, NormRect, OutputMode, RenderSettings, View,
-    ViewMut, font, previous_frames_needed, render, segment_label,
+    Advance, Argb, Blob, Channel, Color, Incremental, MotionSettings, NormRect, OutputMode,
+    RenderSettings, View, ViewMut, font, previous_frames_needed, render, segment_label,
 };
 use vfx_core::cpu::{FrameSource, Image as CpuImage};
 
@@ -294,7 +294,8 @@ fn swarm_piles_frozen_tiles_on_a_clear_canvas() {
     assert_eq!(previous_frames_needed(&s), 23);
     let frames = crossing::<u8>();
     let (out, asked) = render_frames(&s, &frames, 29);
-    assert_eq!(asked.len(), frames.len());
+    // Only the trail and the background before it are read, not every frame handed over.
+    assert_eq!(asked.len(), previous_frames_needed(&s) as usize + 1);
     // Corners are clear canvas, for whatever is behind the layer; somewhere along the
     // square's path there is white picture and the title bar's grey.
     let corner = out.at(0, H - 1);
@@ -473,4 +474,37 @@ fn labels_and_font() {
         fit_text("LO.FI.SCI.FI motion#1.1", text_width("LO.FI", 1), 1),
         "LO..."
     );
+}
+
+/// A change upstream that leaves the luma grid as it was still drops the kept tiles.
+#[test]
+fn swarm_sees_edits_that_keep_the_grid() {
+    let s = swarm_settings();
+    let frames = crossing::<u8>();
+    let last = frames.len() - 1;
+    // A mask: alpha changes, luma doesn't.
+    let mut edited = frames.clone();
+    edited[last].pixels.iter_mut().for_each(|p| p.alpha = 128);
+    let grid = |img: &Image<u8>| downsample(&img.view(), s.grid_width);
+    assert!(grid(&edited[last]) == grid(&frames[last]));
+
+    let mut state = Incremental::default();
+    let mut out = Image::new(W, H);
+    let advance = |state: &mut Incremental, frames: &[Image<u8>], out: &mut Image<u8>| {
+        let mut source = MemoryFrames::new(frames);
+        state.advance(
+            &s,
+            &mut source,
+            frames.len(),
+            last as i64,
+            &mut out.view_mut(),
+        )
+    };
+    assert_eq!(advance(&mut state, &frames, &mut out), Advance::Drawn);
+    assert_eq!(
+        advance(&mut state, &edited, &mut out),
+        Advance::Discontinuity
+    );
+    assert_eq!(advance(&mut state, &edited, &mut out), Advance::Drawn);
+    assert!(out.pixels == render_frames(&s, &edited, last as i64).0.pixels);
 }

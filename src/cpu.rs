@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::ops::Range;
 
 mod sealed {
     pub trait Sealed {}
@@ -16,7 +17,9 @@ mod sealed {
 
 /// One channel type: `u8`, `u16` or `f32`, each valid for any bit pattern. Integer channels
 /// clamp when written; float channels keep any value.
-pub trait Channel: sealed::Sealed + Copy + Default + PartialEq + std::fmt::Debug + 'static {
+pub trait Channel:
+    sealed::Sealed + Copy + Default + PartialEq + Send + Sync + std::fmt::Debug + 'static
+{
     /// The channel's white. After Effects' 16-bit white is 32768, not 65535.
     const MAX: f32;
     fn to_unit(self) -> f32;
@@ -118,6 +121,8 @@ pub struct ViewMut<'a, C> {
     pub width: i32,
     pub height: i32,
     stride: usize,
+    /// The rows `data` holds: all of them, or one band.
+    rows: Range<i32>,
     _channel: PhantomData<C>,
 }
 
@@ -129,6 +134,7 @@ impl<'a, C: Channel> ViewMut<'a, C> {
             width,
             height,
             stride,
+            rows: 0..height.max(0),
             _channel: PhantomData,
         }
     }
@@ -144,15 +150,51 @@ impl<'a, C: Channel> ViewMut<'a, C> {
         self.width <= 0 || self.height <= 0
     }
 
-    pub fn row(&self, y: i32) -> &[Argb<C>] {
-        row(self.data, y, self.width, self.stride)
+    /// The rows this view holds.
+    pub fn rows(&self) -> Range<i32> {
+        self.rows.clone()
     }
 
+    /// Row `y` of the whole picture, which must be one of [`ViewMut::rows`].
+    pub fn row(&self, y: i32) -> &[Argb<C>] {
+        row(self.data, y - self.rows.start, self.width, self.stride)
+    }
+
+    /// Row `y` of the whole picture, which must be one of [`ViewMut::rows`].
     pub fn row_mut(&mut self, y: i32) -> &mut [Argb<C>] {
-        let start = y as usize * self.stride;
+        let start = (y - self.rows.start) as usize * self.stride;
         let bytes = &mut self.data[start..start + row_bytes::<C>(self.width)];
         // `check` made sure every row start is aligned, and any bits are a valid channel.
         unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast(), self.width as usize) }
+    }
+
+    /// Splits the picture into `count` bands of rows that can be drawn on separately, each
+    /// still addressed by the whole picture's row numbers.
+    pub fn bands(&mut self, count: usize) -> Vec<ViewMut<'_, C>> {
+        debug_assert_eq!(self.rows, 0..self.height.max(0));
+        let (width, height, stride) = (self.width, self.height.max(0), self.stride);
+        let count = count.clamp(1, height.max(1) as usize) as i32;
+        let mut rest: &mut [u8] = self.data;
+        let mut bands = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let rows = i * height / count..(i + 1) * height / count;
+            let len = if i + 1 == count {
+                rest.len()
+            } else {
+                rows.len() * stride
+            };
+            let (data, tail) = std::mem::take(&mut rest).split_at_mut(len);
+            rest = tail;
+            bands.push(ViewMut {
+                data,
+                width,
+                height,
+                stride,
+                rows,
+                _channel: PhantomData,
+            });
+        }
+        bands
     }
 }
 
@@ -272,8 +314,8 @@ impl Depth for f32 {
 }
 
 /// The frames a CPU render reads, numbered oldest first, `0..count`; the last is the frame
-/// being rendered. Each is asked for once, in order, so a host can hand out one frame at a
-/// time and take it back as soon as `f` returns.
+/// being rendered. A host can hand out one frame at a time and take it back as soon as `f`
+/// returns. An effect may skip frames, or ask for one again.
 pub trait FrameSource {
     /// Calls `f` with frame `index`, or with `None` if that frame isn't there.
     fn with_frame(&mut self, index: usize, f: &mut dyn FnMut(Option<Image<'_>>));

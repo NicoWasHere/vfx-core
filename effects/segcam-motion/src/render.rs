@@ -6,7 +6,8 @@
 use std::collections::VecDeque;
 
 use crate::font;
-use crate::motion::{self, Blob, LumaGrid, Motion, MotionSettings, NormRect};
+use crate::incremental::Incremental;
+use crate::motion::{Blob, LumaGrid, Motion, MotionSettings, NormRect};
 use crate::pixel::{Argb, Channel, Color, Depth, View, ViewMut, make_pixel, scale_pixel};
 use crate::swarm::{self, SwarmMetrics, Tile};
 use vfx_core::cpu::FrameSource;
@@ -185,7 +186,8 @@ pub fn to_pixels(r: &NormRect, width: i32, height: i32, mirrored: bool) -> Pixel
 }
 
 pub fn fill_rect<C: Channel>(v: &mut ViewMut<C>, r: PixelRect, color: Argb<C>) {
-    let r = intersect(r, PixelRect::new(0, 0, v.width, v.height));
+    let rows = v.rows();
+    let r = intersect(r, PixelRect::new(0, rows.start, v.width, rows.len() as i32));
     if r.is_empty() {
         return;
     }
@@ -361,6 +363,135 @@ pub fn apply_matte<C: Channel>(
 
 // ---------------------------------------------------------------------------------------
 
+/// The tiles a frame's blobs become, biggest first, titled with their labels.
+pub fn frame_tiles<C: Channel>(
+    motion: &Motion,
+    frame: Option<&View<C>>,
+    number: i64,
+    canvas_w: i32,
+    canvas_h: i32,
+    mirrored: bool,
+) -> Vec<Tile> {
+    (motion.blobs.iter().enumerate())
+        .map(|(b, blob)| {
+            let title = format!("LO.FI.SCI.FI {}", segment_label(number, b));
+            swarm::make_tile(blob, frame, title, canvas_w, canvas_h, mirrored)
+        })
+        .collect()
+}
+
+/// A tile in a [`Pile`]: owned, so a buried one can drop its pixels, or borrowed from a cache.
+pub trait PiledTile {
+    fn tile(&self) -> &Tile;
+    /// Called when a newer tile covers this one whole.
+    fn bury(&mut self) {}
+}
+
+impl PiledTile for Tile {
+    fn tile(&self) -> &Tile {
+        self
+    }
+    fn bury(&mut self) {
+        self.hidden = true;
+        self.pixels = Vec::new();
+    }
+}
+
+impl PiledTile for &Tile {
+    fn tile(&self) -> &Tile {
+        self
+    }
+}
+
+/// segcam's pile, oldest first. It is only trimmed by count, so a window stays until
+/// `max_tiles` newer ones push it out. To keep memory bounded, tiles are stored at 8 bits and
+/// a tile buried whole under a newer one drops its pixels, which does not change the picture.
+/// The byte budget is a last resort for extreme piles.
+pub struct Pile<T> {
+    /// Each tile, whether it is buried, and the pixels it still counts for.
+    tiles: VecDeque<(T, bool, usize)>,
+    stored_pixels: usize,
+    title_height: i32,
+    canvas: PixelRect,
+    max_tiles: usize,
+}
+
+impl<T: PiledTile> Pile<T> {
+    const BYTE_BUDGET: usize = 768 << 20;
+
+    pub fn new(canvas_w: i32, canvas_h: i32, max_tiles: i32) -> Self {
+        Self {
+            tiles: VecDeque::new(),
+            stored_pixels: 0,
+            title_height: SwarmMetrics::new(canvas_h).title_height,
+            canvas: PixelRect::new(0, 0, canvas_w, canvas_h),
+            max_tiles: max_tiles.max(1) as usize,
+        }
+    }
+
+    /// Adds `tile` on top, burying older tiles it covers and trimming the oldest.
+    pub fn push(&mut self, tile: T) {
+        let kept = tile.tile().pixels.len();
+        self.stored_pixels += kept;
+        let cover = swarm::tile_extent(tile.tile().video, self.title_height);
+        for (older, buried, counted) in self.tiles.iter_mut().filter(|(_, b, _)| !b) {
+            let shown = intersect(
+                swarm::tile_extent(older.tile().video, self.title_height),
+                self.canvas,
+            );
+            if contains(cover, shown) {
+                *buried = true;
+                self.stored_pixels -= *counted;
+                *counted = 0;
+                older.bury();
+            }
+        }
+        self.tiles.push_back((tile, false, kept));
+        while self.tiles.len() > self.max_tiles
+            || (self.stored_pixels * size_of::<Argb<u8>>() > Self::BYTE_BUDGET
+                && self.tiles.len() > 1)
+        {
+            if let Some((_, _, counted)) = self.tiles.pop_front() {
+                self.stored_pixels -= counted;
+            }
+        }
+    }
+
+    /// The tiles still drawn, oldest first.
+    pub fn shown(&self) -> impl Iterator<Item = &Tile> {
+        self.tiles
+            .iter()
+            .filter(|(_, b, _)| !b)
+            .map(|(t, _, _)| t.tile())
+    }
+}
+
+/// Draws the output for the current frame from its motion and, for the swarm, the pile's
+/// shown tiles.
+pub fn draw_output<'t, C: Channel>(
+    out: &mut ViewMut<C>,
+    s: &RenderSettings,
+    frame: Option<View<C>>,
+    motion: &Motion,
+    frame_number: i64,
+    tiles: impl IntoIterator<Item = &'t Tile>,
+) {
+    let canvas = PixelRect::new(0, 0, out.width, out.height);
+    match (s.mode, frame) {
+        (OutputMode::Swarm, _) => swarm::draw_swarm(out, tiles, s.straight_alpha),
+        (_, None) => fill_rect(out, canvas, Argb::default()),
+        (mode, Some(frame)) => {
+            copy_scaled(&frame, out, s.mirror);
+            if mode == OutputMode::Overlay {
+                draw_overlay(out, &motion.blobs, frame_number, s);
+            } else {
+                let boxes = mode == OutputMode::BoxMatte;
+                apply_matte(out, motion, boxes, s.mirror, s.straight_alpha);
+            }
+        }
+    }
+}
+
 /// Renders the last of `frame_count` frames into `out`. `frame_number` is that frame's
 /// number, used for the IDs; the frame `k` before it is `frame_number - k`. Frames at
 /// another depth than `out` count as missing.
@@ -371,110 +502,5 @@ pub fn render<C: Depth>(
     frame_number: i64,
     out: &mut ViewMut<C>,
 ) {
-    if out.is_empty() {
-        return;
-    }
-    if frame_count == 0 {
-        fill_rect(
-            out,
-            PixelRect::new(0, 0, out.width, out.height),
-            Argb::default(),
-        );
-        return;
-    }
-
-    let is_swarm = s.mode == OutputMode::Swarm;
-    let history_length = s.background_frames.max(1) as usize;
-    let targets = if is_swarm { s.trail_frames.max(1) } else { 1 } as usize;
-    let max_tiles = s.max_tiles.max(1) as usize;
-    // segcam's pile is only ever trimmed by count: a window stays until `max_tiles` newer
-    // ones have pushed it out, however much of the screen it covers. Keeping every tile's
-    // pixels for that long would hold gigabytes on busy footage, where one segment is most
-    // of the picture, so tiles are stored at 8 bits and a tile buried whole under a newer
-    // one keeps its place in the pile but drops its pixels: the picture is the same without
-    // them. The byte budget below is a last resort for pathological piles, not the usual
-    // limit: at 1080p it holds ninety-odd whole frames.
-    let metrics = SwarmMetrics::new(out.height);
-    let canvas = PixelRect::new(0, 0, out.width, out.height);
-    const BYTE_BUDGET: usize = 768 << 20;
-
-    let mut history: VecDeque<LumaGrid> = VecDeque::new();
-    let mut tiles: VecDeque<Tile> = VecDeque::new();
-    let mut stored_pixels = 0usize;
-
-    for i in 0..frame_count {
-        let is_current = i == frame_count - 1;
-        frames.with_frame(i, &mut |image| {
-            let frame = image.and_then(C::view);
-            let grid = frame
-                .as_ref()
-                .map(|f| downsample(f, s.grid_width))
-                .unwrap_or_default();
-
-            let mut current_motion = None;
-            if i + targets >= frame_count {
-                let motion = motion::detect(&history, &grid, &s.motion);
-                if is_swarm {
-                    let number = frame_number - (frame_count - 1 - i) as i64;
-                    for (b, blob) in motion.blobs.iter().enumerate() {
-                        let title = format!("LO.FI.SCI.FI {}", segment_label(number, b));
-                        let tile = swarm::make_tile(
-                            blob,
-                            frame.as_ref(),
-                            title,
-                            out.width,
-                            out.height,
-                            s.mirror,
-                        );
-                        stored_pixels += tile.pixels.len();
-                        let cover = swarm::tile_extent(tile.video, metrics.title_height);
-                        for older in tiles.iter_mut().filter(|t| !t.hidden) {
-                            let shown = intersect(
-                                swarm::tile_extent(older.video, metrics.title_height),
-                                canvas,
-                            );
-                            if contains(cover, shown) {
-                                older.hidden = true;
-                                stored_pixels -= older.pixels.len();
-                                older.pixels = Vec::new();
-                            }
-                        }
-                        tiles.push_back(tile);
-                        while tiles.len() > max_tiles
-                            || (stored_pixels * size_of::<Argb<u8>>() > BYTE_BUDGET
-                                && tiles.len() > 1)
-                        {
-                            if let Some(oldest) = tiles.pop_front() {
-                                stored_pixels -= oldest.pixels.len();
-                            }
-                        }
-                    }
-                }
-                current_motion = Some(motion);
-            }
-
-            history.push_back(grid);
-            if history.len() > history_length {
-                history.pop_front();
-            }
-
-            if !is_current {
-                return;
-            }
-            let motion = current_motion.unwrap_or_default();
-            match (s.mode, frame) {
-                (OutputMode::Swarm, _) => swarm::draw_swarm(out, &tiles, s.straight_alpha),
-                (_, None) => fill_rect(out, canvas, Argb::default()),
-                (mode, Some(frame)) => {
-                    copy_scaled(&frame, out, s.mirror);
-                    if mode == OutputMode::Overlay {
-                        draw_overlay(out, &motion.blobs, frame_number, s);
-                    } else {
-                        let boxes = mode == OutputMode::BoxMatte;
-                        apply_matte(out, &motion, boxes, s.mirror, s.straight_alpha);
-                    }
-                }
-            }
-        });
-    }
+    let _ = Incremental::default().advance(s, frames, frame_count, frame_number, out);
 }
