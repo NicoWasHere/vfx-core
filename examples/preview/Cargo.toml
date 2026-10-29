@@ -22,6 +22,14 @@ web-time = "1.1.0"
 egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 pollster = "1.0.1"
+# Native file picker for "Import…".
+rfd = "0.17.2"
+# Runs the face model (models/face_detection_yunet_2023mar.onnx).
+ort = "=2.0.0-rc.15"
+
+[target.'cfg(windows)'.dependencies]
+# A job object, so ffmpeg and ffplay close with the app.
+windows-sys = { version = "0.61.2", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # The web build (GitHub Pages): WebGPU in the browser, started from JavaScript.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

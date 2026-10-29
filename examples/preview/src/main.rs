@@ -1,20 +1,30 @@
 //! Standalone preview of the vfx-core effect chain, with a control panel.
 //!
-//! The image is a generated test pattern (or a PNG / JPEG dropped on the window). It
-//! runs through the same pipeline the After Effects, OpenFX and FFGL plugins use, plus
+//! The image is a generated test pattern (or a PNG / JPEG, or a video file decoded by
+//! ffmpeg, dropped on the window). It runs through the same pipeline the After Effects, OpenFX and FFGL plugins use, plus
 //! a feedback trail, all on the GPU. The panel on the right drives every parameter;
 //! clicking the image moves the vignette centre. Escape quits.
 //!
 //! This is a separate crate so vfx-core never depends on windowing or UI code.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod audio;
 mod controls;
 mod effects;
+#[cfg(not(target_arch = "wasm32"))]
+mod export;
+#[cfg(not(target_arch = "wasm32"))]
+mod face;
+mod modulation;
+#[cfg(not(target_arch = "wasm32"))]
+mod video;
 
 use std::sync::Arc;
 use web_time::Instant;
 
 use controls::{Controls, Status};
 use effects::Effects;
+use modulation::{Expressions, Sources};
 use vfx_core::Gpu;
 use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,10 +48,62 @@ struct Preview {
     image: egui::TextureId,
     image_size: (u32, u32),
     controls: Controls,
+    exprs: Expressions,
+    /// The expression variables for the frame on screen.
+    sources: Sources,
+    #[cfg(not(target_arch = "wasm32"))]
+    media: Option<Media>,
+    #[cfg(not(target_arch = "wasm32"))]
+    sound_on: bool,
+    /// Whether the frame on screen is flipped (x, y), after expressions; face
+    /// positions are mirrored to match it.
+    flipped: [bool; 2],
+    /// Runs while face tracking is switched on.
+    #[cfg(not(target_arch = "wasm32"))]
+    tracker: Option<face::Tracker>,
+    /// Cameras found at startup.
+    #[cfg(not(target_arch = "wasm32"))]
+    cameras: Vec<String>,
     time: f64,
     last_frame: Instant,
     fps: f32,
     message: Option<String>,
+}
+
+/// A video file or webcam and everything that goes with it.
+#[cfg(not(target_arch = "wasm32"))]
+struct Media {
+    video: video::Video,
+    /// The file's sound, analysed for expressions; None for webcams.
+    audio: Option<audio::Audio>,
+    sound: Option<video::Sound>,
+    export: Option<export::Export>,
+    /// While the position slider is being dragged.
+    scrub: Option<Scrub>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct Scrub {
+    /// Whether to play again when the drag ends.
+    resume: bool,
+    /// Where the slider is, shown instead of the playback position.
+    shown: f64,
+    /// A seek waiting for the last one to settle; dragging asks for one every frame.
+    pending: Option<f64>,
+    last_seek: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Media {
+    /// Seeks, playing on or paused there, with the sound following along.
+    fn seek(&mut self, position: f64, play: bool, sound_on: bool) -> Result<(), String> {
+        self.sound = None;
+        self.video.seek(position, play)?;
+        if play && sound_on {
+            self.sound = video::Sound::play(&self.video.info, self.video.position());
+        }
+        Ok(())
+    }
 }
 
 impl Preview {
@@ -89,7 +151,7 @@ impl Preview {
         surface.configure(&gpu.device, &config);
 
         let egui = egui::Context::default();
-        let egui_state = egui_winit::State::new(
+        let mut egui_state = egui_winit::State::new(
             egui.clone(),
             egui::ViewportId::ROOT,
             &window,
@@ -97,6 +159,10 @@ impl Preview {
             None,
             Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
+        // The window's first "focused" event arrives while the GPU is still being set
+        // up, before there's anything to pass it to. Without this egui thinks the
+        // window is unfocused, and hides the text cursor until focus changes again.
+        egui_state.egui_input_mut().focused = window.has_focus();
         let mut egui_renderer =
             egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
 
@@ -120,6 +186,17 @@ impl Preview {
             image,
             image_size,
             controls: Controls::default(),
+            exprs: Expressions::default(),
+            sources: modulation::sources(0.0, None, [0.0; 5], modulation::FACE_NONE),
+            #[cfg(not(target_arch = "wasm32"))]
+            media: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            sound_on: true,
+            flipped: [false; 2],
+            #[cfg(not(target_arch = "wasm32"))]
+            tracker: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cameras: video::cameras(),
             time: 0.0,
             last_frame: Instant::now(),
             fps: 0.0,
@@ -146,14 +223,236 @@ impl Preview {
         }
     }
 
+    /// Opens an image or video file (dropped or imported).
     #[cfg(not(target_arch = "wasm32"))]
     fn open(&mut self, path: &std::path::Path) {
+        if video::is_video(path) {
+            self.open_input(video::Input::File(path.to_path_buf()));
+            return;
+        }
+        self.media = None;
         self.message = self
             .effects
             .load_image(&self.gpu, path)
             .err()
             .map(|e| format!("Couldn't open {}: {e}", path.display()));
         self.refresh_image();
+    }
+
+    /// Starts a video file or webcam as the source.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_input(&mut self, input: video::Input) {
+        // Stops the old video, its sound and any export first.
+        self.media = None;
+        let name = input.name();
+        self.message = match video::Video::open(input, effects::MAX_IMAGE_SIDE) {
+            Ok(video) => {
+                self.effects.start_stream(&self.gpu, name, video.info.size);
+                let file = video.info.file();
+                self.media = Some(Media {
+                    sound: self
+                        .sound_on
+                        .then(|| video::Sound::play(&video.info, 0.0))
+                        .flatten(),
+                    audio: file.map(audio::Audio::load),
+                    video,
+                    export: None,
+                    scrub: None,
+                });
+                None
+            }
+            Err(e) => Some(format!("Couldn't open {name}: {e}")),
+        };
+        self.refresh_image();
+    }
+
+    /// Works out this frame's expression variables, then renders either the live preview or
+    /// the next stretch of a running export.
+    fn render_effects(&mut self, dt: f64) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(media) = &mut self.media {
+            if let Some(export) = &mut media.export {
+                let done = export.step(
+                    &self.gpu,
+                    &mut self.effects,
+                    &self.controls,
+                    &mut self.exprs,
+                    media.audio.as_ref().expect("only files are rendered"),
+                    std::time::Duration::from_millis(50),
+                );
+                match done {
+                    Ok(false) => return,
+                    Ok(true) => {
+                        self.message = Some(format!("Saved {}", export.out.display()));
+                    }
+                    Err(e) => self.message = Some(format!("Render failed: {e}")),
+                }
+                media.export = None;
+                self.exprs.reset();
+                self.effects.rebuild_feedback(&self.gpu);
+                if self.sound_on {
+                    media.sound = video::Sound::play(&media.video.info, media.video.position());
+                }
+            }
+
+            // Dragging the slider: show the frame under it, at most every 60 ms.
+            if let Some(scrub) = &mut media.scrub
+                && let Some(position) = scrub.pending
+                && scrub.last_seek.elapsed().as_millis() >= 60
+            {
+                scrub.pending = None;
+                scrub.last_seek = Instant::now();
+                media.sound = None;
+                if let Err(e) = media.video.seek(position, false) {
+                    self.message = Some(e);
+                }
+            }
+            // Loop at the end.
+            if media.video.ended()
+                && let Err(e) = media.seek(0.0, true, self.sound_on)
+            {
+                self.message = Some(e);
+            }
+
+            if let Some(pixels) = media.video.take_frame() {
+                self.effects.write_source(&self.gpu, &pixels);
+                if let Some(tracker) = &self.tracker {
+                    tracker.submit(pixels, media.video.info.size);
+                }
+            }
+            let position = media.video.position();
+            self.sources = modulation::sources(
+                self.time,
+                Some((position, media.video.info.duration)),
+                media
+                    .audio
+                    .as_ref()
+                    .map_or([0.0; 5], |a| a.levels(position)),
+                modulation::flip_face(
+                    self.tracker
+                        .as_ref()
+                        .map_or(modulation::FACE_NONE, face::Tracker::values),
+                    self.flipped[0],
+                    self.flipped[1],
+                ),
+            );
+        } else {
+            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.sources = modulation::sources(self.time, None, [0.0; 5], modulation::FACE_NONE);
+        }
+
+        let controls = self.exprs.apply(&self.controls, &self.sources, dt as f32);
+        self.flipped = [controls.flip_x > 0.5, controls.flip_y > 0.5];
+        self.effects.render(&self.gpu, &controls, self.time, false);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_media_actions(&mut self, actions: &controls::Actions) {
+        if actions.import
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Import a video or image")
+                .add_filter(
+                    "Video or image",
+                    &[
+                        "mp4", "mov", "m4v", "mkv", "webm", "avi", "gif", "wmv", "png", "jpg",
+                        "jpeg",
+                    ],
+                )
+                .pick_file()
+        {
+            self.open(&path);
+        }
+        if let Some(camera) = actions.start_camera
+            && let Some(name) = self.cameras.get(camera)
+        {
+            self.open_input(video::Input::Camera(name.clone()));
+        }
+        if actions.refresh_cameras {
+            self.cameras = video::cameras();
+        }
+        if let Some(on) = actions.face_tracking {
+            self.tracker = None;
+            if on {
+                match face::Tracker::start() {
+                    Ok(tracker) => self.tracker = Some(tracker),
+                    Err(e) => self.message = Some(e),
+                }
+            }
+        }
+        if let Some(on) = actions.sound {
+            self.sound_on = on;
+            if let Some(media) = &mut self.media {
+                media.sound = (on && media.export.is_none() && media.video.playing())
+                    .then(|| video::Sound::play(&media.video.info, media.video.position()))
+                    .flatten();
+            }
+        }
+        if actions.toggle_play {
+            self.toggle_play();
+        }
+        let Some(media) = &mut self.media else {
+            return;
+        };
+        if let Some(position) = actions.scrub {
+            let resume = media.video.playing();
+            let scrub = media.scrub.get_or_insert_with(|| Scrub {
+                resume,
+                shown: position,
+                pending: None,
+                last_seek: Instant::now(),
+            });
+            scrub.shown = position;
+            scrub.pending = Some(position);
+        }
+        if let Some(position) = actions.scrub_done {
+            let resume = media
+                .scrub
+                .take()
+                .map_or_else(|| media.video.playing(), |s| s.resume);
+            if let Err(e) = media.seek(position, resume, self.sound_on) {
+                self.message = Some(e);
+            }
+        }
+        if actions.start_export && media.export.is_none() {
+            match export::Export::start(&media.video.info, self.tracker.is_some()) {
+                Ok(export) => {
+                    media.export = Some(export);
+                    media.sound = None;
+                    self.exprs.reset();
+                    self.effects.rebuild_feedback(&self.gpu);
+                    self.message = None;
+                }
+                Err(e) => self.message = Some(format!("Couldn't start the render: {e}")),
+            }
+        }
+        if actions.cancel_export
+            && let Some(export) = media.export.take()
+        {
+            self.message = Some(format!(
+                "Render cancelled; {} is incomplete",
+                export.out.display()
+            ));
+            if self.sound_on {
+                media.sound = video::Sound::play(&media.video.info, media.video.position());
+            }
+        }
+    }
+
+    /// Plays or pauses a video file (not a webcam, nor during a render).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn toggle_play(&mut self) {
+        if let Some(media) = &mut self.media
+            && media.video.info.file().is_some()
+            && media.export.is_none()
+        {
+            let (position, play) = (media.video.position(), !media.video.playing());
+            if let Err(e) = media.seek(position, play, self.sound_on) {
+                self.message = Some(e);
+            }
+        }
     }
 
     fn draw(&mut self) {
@@ -167,32 +466,80 @@ impl Preview {
             self.time += dt;
         }
 
-        self.effects.render(&self.gpu, &self.controls, self.time);
+        self.render_effects(dt);
 
         let input = self.egui_state.take_egui_input(&self.window);
         let (image, image_size) = (self.image, self.image_size);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (video, sound_on, export, cameras, face_tracking) = (
+            self.media
+                .as_ref()
+                .is_some_and(|m| m.video.info.file().is_some()),
+            self.sound_on,
+            self.media
+                .as_ref()
+                .and_then(|m| m.export.as_ref())
+                .map(|e| e.progress()),
+            self.cameras.as_slice(),
+            self.tracker.is_some(),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let playback = self
+            .media
+            .as_ref()
+            .filter(|m| m.video.info.file().is_some())
+            .map(|m| controls::Playback {
+                position: m
+                    .scrub
+                    .as_ref()
+                    .map_or_else(|| m.video.position(), |s| s.shown),
+                duration: m.video.info.duration,
+                playing: m
+                    .scrub
+                    .as_ref()
+                    .map_or_else(|| m.video.playing(), |s| s.resume),
+            });
+        #[cfg(target_arch = "wasm32")]
+        let (video, sound_on, export, cameras, face_tracking, playback) =
+            (false, false, None, &[][..], false, None);
         let status = Status {
             fps: self.fps,
             size: image_size,
             image: self.effects.image_name(),
             message: self.message.as_deref(),
+            video,
+            sound_on,
+            export,
+            cameras,
+            face_tracking,
+            playback,
         };
         let controls = &mut self.controls;
+        let exprs = &mut self.exprs;
+        let sources = &self.sources;
         let mut actions = controls::Actions::default();
         let output = self.egui.run_ui(input, |ui| {
             egui::Panel::right("controls")
                 .resizable(false)
                 .exact_size(320.0)
-                .show(ui, |ui| actions = controls::panel(ui, controls, &status));
+                .show(ui, |ui| {
+                    actions = controls::panel(ui, controls, exprs, sources, &status)
+                });
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(18)))
                 .show(ui, |ui| show_image(ui, image, image_size, controls));
         });
         if actions.clear_image {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.media = None;
+            }
             self.effects.clear_image(&self.gpu);
             self.message = None;
             self.refresh_image();
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.handle_media_actions(&actions);
         self.egui_state
             .handle_platform_output(&self.window, output.platform_output);
         // Apply texture updates before anything can skip the frame: egui sends each
@@ -380,8 +727,13 @@ impl ApplicationHandler<Ready> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Ready) {
         match event {
-            Ready::Preview(preview) => {
+            Ready::Preview(mut preview) => {
                 report("");
+                // `vfx-preview clip.mp4` (or "Open with") starts with that file.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(path) = std::env::args_os().nth(1) {
+                    preview.open(std::path::Path::new(&path));
+                }
                 preview.window.request_redraw();
                 self.preview = Some(*preview);
             }
@@ -421,6 +773,17 @@ impl ApplicationHandler<Ready> for App {
             {
                 event_loop.exit();
             }
+            // Space plays and pauses a video, unless a text box has the keyboard.
+            #[cfg(not(target_arch = "wasm32"))]
+            WindowEvent::KeyboardInput { event, .. }
+                if !consumed
+                    && !preview.egui.egui_wants_keyboard_input()
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && event.logical_key == Key::Named(NamedKey::Space) =>
+            {
+                preview.toggle_play();
+            }
             WindowEvent::RedrawRequested => preview.draw(),
             _ => {}
         }
@@ -435,6 +798,7 @@ impl ApplicationHandler<Ready> for App {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    video::kill_children_on_exit();
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = App::new(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
